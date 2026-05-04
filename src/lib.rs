@@ -13,7 +13,7 @@
 //!
 //! ```rust
 //! # fn main() {
-//! # let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+//! # let rt = tokio::runtime::Builder::new_current_thread().enable_time().enable_io().build().unwrap();
 //! # rt.block_on(async {
 //! use awaitgroup::WaitGroup;
 //!
@@ -21,9 +21,9 @@
 //!
 //! for _ in 0..5 {
 //!     // Create a new worker.
-//!     let worker = wg.worker();
+//!     let worker = wg.worker().add();
 //!
-//!     tokio::spawn(async {
+//!     tokio::spawn(async move {
 //!         // Do some work...
 //!
 //!         // This task is done all of its work.
@@ -41,13 +41,13 @@
 //! ```rust
 //! # use awaitgroup::WaitGroup;
 //! # fn main() {
-//! # let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+//! # let rt = tokio::runtime::Builder::new_current_thread().enable_time().enable_io().build().unwrap();
 //! # rt.block_on(async {
 //! let mut wg = WaitGroup::new();
 //!
-//! let worker = wg.worker();
+//! let worker = wg.worker().add();
 //!
-//! tokio::spawn(async {
+//! tokio::spawn(async move {
 //!     // Do work...
 //!     worker.done();
 //! });
@@ -56,9 +56,9 @@
 //! wg.wait().await;
 //!
 //! // Re-use wait group
-//! let worker = wg.worker();
+//! let worker = wg.worker().add();
 //!
-//! tokio::spawn(async {
+//! tokio::spawn(async move {
 //!     // Do more work...
 //!     worker.done();
 //! });
@@ -68,6 +68,8 @@
 //! # }
 //! ```
 #![deny(missing_debug_implementations, rust_2018_idioms)]
+use anyhow::anyhow;
+use anyhow::Result;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -78,6 +80,7 @@ use std::task::{Context, Poll, Waker};
 /// Wait for a collection of tasks to finish execution.
 ///
 /// Refer to the [crate level documentation](crate) for details.
+#[derive(Clone)]
 pub struct WaitGroup {
     inner: Arc<Inner>,
 }
@@ -105,11 +108,15 @@ impl WaitGroup {
     }
 
     /// Wait until all registered workers finish executing.
-    pub async fn wait(&self) {
+    pub async fn wait(&self) -> Result<()> {
         WaitGroupFuture::new(&self.inner).await
     }
 
-    pub async fn wait_or_error(&self, count: usize) -> bool {
+    pub fn count(&self) -> i32 {
+        self.inner.count.load(Ordering::Relaxed)
+    }
+
+    pub async fn wait_complete(&self, count: usize) -> Result<()> {
         WaitGroupErrorFuture::new(&self.inner, count).await
     }
 }
@@ -125,21 +132,36 @@ impl<'a> WaitGroupFuture<'a> {
 }
 
 impl Future for WaitGroupFuture<'_> {
-    type Output = ();
+    type Output = Result<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let waker = cx.waker().clone();
-        *self.inner.waker.lock().unwrap() = Some(waker);
         let count = self.inner.count.load(Ordering::Relaxed);
         if count < 0 {
-            log::error!("count < 0");
+            return Poll::Ready(Err(anyhow!("err:count < 0 => count:{}", count)));
         }
+        {
+            let error = &mut *self.inner.error.lock().unwrap();
+            if error.is_some() {
+                return Poll::Ready(Err(anyhow!(
+                    "err:error => count:{}, err:{}",
+                    count,
+                    error.take().unwrap()
+                )));
+            }
+        }
+
         match count {
             0 => {
                 self.inner.complete.store(true, Ordering::SeqCst);
-                Poll::Ready(())
+                Poll::Ready(Ok(()))
             }
-            _ => Poll::Pending,
+            _ => {
+                let waker = cx.waker().clone();
+                {
+                    *self.inner.waker.lock().unwrap() = Some(waker)
+                };
+                Poll::Pending
+            }
         }
     }
 }
@@ -156,28 +178,32 @@ impl<'a> WaitGroupErrorFuture<'a> {
 }
 
 impl Future for WaitGroupErrorFuture<'_> {
-    type Output = bool;
+    type Output = Result<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let waker = cx.waker().clone();
-        *self.inner.waker.lock().unwrap() = Some(waker);
+        {
+            *self.inner.waker.lock().unwrap() = Some(waker);
+        }
+
         let count = self.inner.count.load(Ordering::Relaxed);
+        if count < 0 {
+            return Poll::Ready(Err(anyhow!("err:count < 0 => count:{}", count)));
+        }
+        {
+            let error = &mut *self.inner.error.lock().unwrap();
+            if error.is_some() {
+                return Poll::Ready(Err(anyhow!(
+                    "err:error => count:{}, err:{}",
+                    count,
+                    error.take().unwrap()
+                )));
+            }
+        }
 
         if count == self.count as i32 {
-            if self.inner.error.load(Ordering::Relaxed) {
-                self.inner.error.store(false, Ordering::Relaxed);
-                Poll::Ready(true)
-            } else {
-                self.inner.complete.store(true, Ordering::SeqCst);
-                Poll::Ready(false)
-            }
-        } else if self.inner.error.load(Ordering::Relaxed) {
-            self.inner.error.store(false, Ordering::Relaxed);
-            Poll::Ready(true)
-        } else if count < 0 {
-            log::error!("count < 0");
-            self.inner.error.store(false, Ordering::Relaxed);
-            Poll::Ready(true)
+            self.inner.complete.store(true, Ordering::SeqCst);
+            Poll::Ready(Ok(()))
         } else {
             Poll::Pending
         }
@@ -187,7 +213,7 @@ impl Future for WaitGroupErrorFuture<'_> {
 struct Inner {
     waker: Mutex<Option<Waker>>,
     count: AtomicI32,
-    error: AtomicBool,
+    error: Arc<Mutex<Option<anyhow::Error>>>,
     complete: AtomicBool,
 }
 
@@ -196,7 +222,7 @@ impl Inner {
         Self {
             count: AtomicI32::new(0),
             waker: Mutex::new(None),
-            error: AtomicBool::new(false),
+            error: Arc::new(Mutex::new(None)),
             complete: AtomicBool::new(false),
         }
     }
@@ -205,6 +231,7 @@ impl Inner {
 /// A worker registered in a `WaitGroup`.
 ///
 /// Refer to the [crate level documentation](crate) for details.
+#[derive(Clone)]
 pub struct Worker {
     inner: Arc<Inner>,
 }
@@ -218,11 +245,14 @@ impl Worker {
     }
     pub fn add(&self) -> WorkerInner {
         if self.inner.complete.load(Ordering::SeqCst) {
-            log::error!("complete is true");
+            log::error!(
+                "complete is true, count:{}",
+                self.inner.count.load(Ordering::Relaxed)
+            );
         }
 
         self.inner.count.fetch_add(1, Ordering::Relaxed);
-        if let Some(waker) = self.inner.waker.lock().unwrap().take() {
+        if let Some(waker) = { self.inner.waker.lock().unwrap().take() } {
             waker.wake();
         }
         WorkerInner {
@@ -230,14 +260,15 @@ impl Worker {
         }
     }
 
-    pub fn error(&self) {
-        if self.inner.complete.load(Ordering::SeqCst) {
-            log::error!("complete is true");
-        }
+    pub fn count(&self) -> i32 {
+        self.inner.count.load(Ordering::Relaxed)
+    }
 
-        self.inner.count.fetch_add(1, Ordering::Relaxed);
-        self.inner.error.store(true, Ordering::Relaxed);
-        if let Some(waker) = self.inner.waker.lock().unwrap().take() {
+    pub fn error(&self, err: anyhow::Error) {
+        {
+            *self.inner.error.lock().unwrap() = Some(err);
+        }
+        if let Some(waker) = { self.inner.waker.lock().unwrap().take() } {
             waker.wake();
         }
     }
@@ -254,9 +285,16 @@ impl WorkerInner {
         }
     }
 
+    pub fn count(&self) -> i32 {
+        self.inner.count.load(Ordering::Relaxed)
+    }
+
     pub fn done(&self) {
         if self.inner.complete.load(Ordering::SeqCst) {
-            log::error!("complete is true");
+            log::error!(
+                "complete is true, count:{}",
+                self.inner.count.load(Ordering::Relaxed)
+            );
         }
 
         let count = self.inner.count.fetch_sub(1, Ordering::Relaxed);
@@ -265,9 +303,18 @@ impl WorkerInner {
         }
         // We are the last worker
         if count == 1 {
-            if let Some(waker) = self.inner.waker.lock().unwrap().take() {
+            if let Some(waker) = { self.inner.waker.lock().unwrap().take() } {
                 waker.wake();
             }
+        }
+    }
+
+    pub fn error(&self, err: anyhow::Error) {
+        {
+            *self.inner.error.lock().unwrap() = Some(err);
+        }
+        if let Some(waker) = { self.inner.waker.lock().unwrap().take() } {
+            waker.wake();
         }
     }
 }
@@ -301,38 +348,39 @@ mod tests {
     #[test]
     fn test_wait_group() {
         let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .enable_io()
             .build()
             .unwrap();
 
         rt.block_on(async move {
-            let mut wg = WaitGroup::new();
-            let wk = wg.worker();
+            let wg = WaitGroup::new();
 
             for _ in 0..5 {
-                let worker = wk.add();
+                let worker = wg.worker().add();
 
-                tokio::spawn(async {
+                tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_secs(5)).await;
                     worker.done();
                 });
             }
 
-            wg.wait().await;
+            let _ = wg.wait().await;
         });
     }
 
     #[test]
     fn test_wait_group_reuse() {
         let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .enable_io()
             .build()
             .unwrap();
 
         rt.block_on(async {
-            let mut wg = WaitGroup::new();
-            let wk = wg.worker();
-
+            let wg = WaitGroup::new();
             for _ in 0..5 {
-                let worker = wk.add();
+                let worker = wg.worker().add();
 
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -340,35 +388,33 @@ mod tests {
                 });
             }
 
-            wg.wait().await;
+            let _ = wg.wait().await;
 
-            let wk = wg.worker();
-            let worker = wk.add();
+            let worker = wg.worker().add();
 
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 worker.done();
             });
 
-            wg.wait().await;
+            let _ = wg.wait().await;
         });
     }
 
     #[test]
     fn test_worker_clone() {
         let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .enable_io()
             .build()
             .unwrap();
 
         rt.block_on(async {
-            let mut wg = WaitGroup::new();
-            let wk = wg.worker();
-
+            let wg = WaitGroup::new();
             for _ in 0..5 {
-                let worker = wk.new().add();
-
+                let worker = wg.worker().add();
                 tokio::spawn(async move {
-                    let nested_worker = worker.add();
+                    let nested_worker = worker.worker().add();
                     tokio::spawn(async move {
                         nested_worker.done();
                     });
@@ -376,7 +422,7 @@ mod tests {
                 });
             }
 
-            wg.wait().await;
+            let _ = wg.wait().await;
         });
     }
 }

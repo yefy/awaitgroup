@@ -12,6 +12,7 @@ readme = "README.md"
 
 [dependencies]
 log = "0.4.14"
+anyhow = { git = "https://github.com/yefy/anyhow.git" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "time"] }
