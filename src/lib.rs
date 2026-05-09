@@ -50,7 +50,7 @@
 //!
 //! tokio::spawn(async move {
 //!     // Do work...
-//!     let _ = wgg;
+//!     let _wgg = wgg;
 //! });
 //!
 //! // Wait for tasks to finish
@@ -61,7 +61,7 @@
 //!
 //! tokio::spawn(async move {
 //!     // Do more work...
-//!    let _ = wgg;
+//!    let _wgg = wgg;
 //! });
 //!
 //! wg.wait().await;
@@ -327,7 +327,7 @@ mod tests {
             for _ in 0..5 {
                 let wgg = wg.guard_add();
                 tokio::spawn(async move {
-                    let _ = wgg;
+                    let _wgg = wgg;
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 });
             }
@@ -362,7 +362,7 @@ mod tests {
                 tokio::spawn(async move {
                     let wgg = wg.guard_add();
                     tokio::spawn(async move {
-                        let _ = wgg;
+                        let _wgg = wgg;
                         tokio::time::sleep(Duration::from_secs(1)).await;
                     });
                     wg.done();
@@ -390,11 +390,10 @@ mod tests {
                 tokio::spawn(async move {
                     let wgg = wg.guard_add();
                     tokio::spawn(async move {
+                        let wgg = wgg;
                         tokio::time::sleep(Duration::from_secs(1)).await;
                         if i == 3 {
                             wgg.set_error(anyhow!("error: i == 3"));
-                        } else {
-                            let _ = wgg;
                         }
                     });
                     wg.done();
