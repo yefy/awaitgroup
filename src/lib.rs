@@ -68,6 +68,40 @@
 //! # });
 //! # }
 //! ```
+//!
+//! If a previous round ended with an error, call [`WaitGroup::reset_error`]
+//! before reusing the group — otherwise the next `wait` will immediately
+//! return the stale error.
+//! ```rust
+//! # use awaitgroup::WaitGroup;
+//! # use anyhow::anyhow;
+//! # fn main() {
+//! # let rt = tokio::runtime::Builder::new_current_thread().enable_time().enable_io().build().unwrap();
+//! # rt.block_on(async {
+//! let wg = WaitGroup::new();
+//!
+//! {
+//!     let wg = wg.clone();
+//!     wg.add();
+//!     tokio::spawn(async move {
+//!         wg.set_error(anyhow!("something went wrong"));
+//!     });
+//! }
+//!
+//! assert!(wg.wait().await.is_err());
+//!
+//! // Clear the sticky error before reusing.
+//! wg.reset_error();
+//!
+//! let wgg = wg.guard_add();
+//! tokio::spawn(async move {
+//!     let _wgg = wgg;
+//! });
+//!
+//! assert!(wg.wait().await.is_ok());
+//! # });
+//! # }
+//! ```
 #![deny(missing_debug_implementations, rust_2018_idioms)]
 use anyhow::anyhow;
 use anyhow::Result;
@@ -111,6 +145,10 @@ impl Inner {
         self.notify();
     }
 
+    pub fn reset_error(&self) {
+        *self.error.lock().unwrap() = None;
+    }
+
     pub fn get_error(&self) -> Option<Arc<anyhow::Error>> {
         self.error.lock().unwrap().clone()
     }
@@ -133,7 +171,30 @@ impl Inner {
 
 /// Wait for a collection of tasks to finish execution.
 ///
-/// Refer to the [crate level documentation](crate) for details.
+/// Refer to the [crate level documentation](crate) for examples.
+///
+/// # Invariants (caller's responsibility)
+///
+/// The library performs no bookkeeping beyond a single atomic counter and a
+/// single waker slot. The caller is responsible for upholding the following
+/// invariants — violating them leads to panics, deadlocks, or lost errors:
+///
+/// 1. **Balanced add/done.** Every [`add`](Self::add) / [`add_num`](Self::add_num)
+///    / [`guard_add`](Self::guard_add) must be balanced by **exactly one**
+///    matching [`done`](Self::done) / [`set_error`](Self::set_error) /
+///    [`WaitGroupGuard`] drop. Calling `done` (or `set_error`) more times than
+///    `add` will panic; calling fewer times will make [`wait`](Self::wait)
+///    hang forever.
+/// 2. **Never `done` and `set_error` for the same worker.**
+///    [`set_error`](Self::set_error) internally performs one `done`, so each
+///    worker must call **either** `done` **or** `set_error`, not both.
+/// 3. **Single waiter.** At most one task may be in [`wait`](Self::wait) at a
+///    time. Concurrent waiters are **not** supported — only the most recently
+///    registered waker is kept, so earlier waiters may be stuck forever.
+/// 4. **Reset before reuse after error.** Once any worker calls `set_error`,
+///    the error is sticky and every subsequent `wait` returns `Err`. Call
+///    [`reset_error`](Self::reset_error) before reusing the `WaitGroup` for a
+///    new round of work.
 #[derive(Clone)]
 pub struct WaitGroup {
     inner: Arc<Inner>,
@@ -156,11 +217,17 @@ impl fmt::Debug for WaitGroup {
 
 #[allow(clippy::new_without_default)]
 impl WaitGroup {
-    /// Creates a new `WaitGroup`.
+    /// Creates a new `WaitGroup` with an initial count of `0`.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Atomically increments the worker count by `1` and returns a
+    /// [`WaitGroupGuard`] that decrements the count back when dropped.
+    ///
+    /// Prefer this over the manual [`add`](Self::add) + [`done`](Self::done)
+    /// pair when you want RAII semantics (e.g. so a panicking or cancelled
+    /// task still releases its slot).
     pub fn guard_add(&self) -> WaitGroupGuard {
         self.add();
         WaitGroupGuard {
@@ -168,33 +235,107 @@ impl WaitGroup {
         }
     }
 
+    /// Increments the worker count by `1`.
+    ///
+    /// Must be paired with **exactly one** later call to [`done`](Self::done)
+    /// or [`set_error`](Self::set_error). See the
+    /// [type-level invariants](Self#invariants-callers-responsibility).
     pub fn add(&self) {
         self.inner.count.fetch_add(1, Ordering::SeqCst);
     }
 
+    /// Increments the worker count by `num`.
+    ///
+    /// Must be paired with exactly `num` later calls to [`done`](Self::done)
+    /// (or [`set_error`](Self::set_error)). The caller is responsible for
+    /// keeping the running count non-negative; the library does not validate
+    /// `num`.
     pub fn add_num(&self, num: i32) {
         self.inner.count.fetch_add(num, Ordering::SeqCst);
     }
 
+    /// Decrements the worker count by `1` and notifies the current waiter if
+    /// the count reaches `0`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the count is already `0` (i.e. `done` has been called more
+    /// times than `add`). See the
+    /// [type-level invariants](Self#invariants-callers-responsibility).
     pub fn done(&self) {
         self.inner.done()
     }
 
-    /// Wait until all registered workers finish executing.
+    /// Waits until either the worker count reaches `0` or a worker reports an
+    /// error via [`set_error`](Self::set_error).
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())` once all registered workers have called `done` and no error
+    ///   has been recorded.
+    /// - `Err(_)` if any worker called `set_error`. The error is **sticky**;
+    ///   call [`reset_error`](Self::reset_error) before reusing this
+    ///   `WaitGroup` for a new round of work.
+    ///
+    /// # Concurrency
+    ///
+    /// Only **one** task may be inside `wait` at a time. Concurrent waiters
+    /// are not supported — only the most recently registered waker is kept,
+    /// so earlier waiters can be stuck forever. See the
+    /// [type-level invariants](Self#invariants-callers-responsibility).
     pub async fn wait(&self) -> Result<()> {
         WaitGroupFuture::new(&self.inner).await
     }
 
+    /// Returns the current worker count.
+    ///
+    /// This is informational and inherently racy — by the time the caller
+    /// inspects the value, other threads may have changed it.
     pub fn count(&self) -> i32 {
         self.inner.count()
     }
 
+    /// Records an error and decrements the worker count by `1` (acts as a
+    /// failing [`done`](Self::done)).
+    ///
+    /// A worker must call **either** `done` **or** `set_error`, never both —
+    /// `set_error` already performs one `done` internally. Calling both will
+    /// over-decrement the count and eventually panic.
+    ///
+    /// The error is sticky: once set, every subsequent [`wait`](Self::wait)
+    /// returns `Err` until [`reset_error`](Self::reset_error) is called.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the count is already `0` (same condition as `done`).
     pub fn set_error(&self, err: anyhow::Error) {
         self.inner.set_error(err);
         self.inner.done();
     }
+
+    /// Clears any error previously recorded by [`set_error`](Self::set_error).
+    ///
+    /// Call this before reusing the `WaitGroup` after a failed `wait`,
+    /// otherwise the next `wait` will immediately return the stale error.
+    /// It is safe to call when no error is set (it is a no-op in that case).
+    pub fn reset_error(&self) {
+        self.inner.reset_error();
+    }
 }
 
+/// RAII handle returned by [`WaitGroup::guard_add`].
+///
+/// Dropping the guard decrements the underlying worker count by `1`,
+/// equivalent to calling [`WaitGroup::done`]. This makes it convenient to
+/// pair an `add` with its matching `done` even in the presence of early
+/// returns, cancellations, or panics.
+///
+/// # Panics
+///
+/// `Drop` calls `done` internally, which panics if the count is already `0`.
+/// This should never happen under normal use (each guard owns exactly one
+/// slot) unless the caller has manually called `done`/`set_error` on the
+/// `WaitGroup` for this guard's slot.
 pub struct WaitGroupGuard {
     inner: Arc<Inner>,
 }
@@ -215,6 +356,16 @@ impl fmt::Debug for WaitGroupGuard {
 }
 
 impl WaitGroupGuard {
+    /// Records an error on the underlying `WaitGroup` **without** decrementing
+    /// the worker count — the matching decrement happens when this guard is
+    /// dropped.
+    ///
+    /// This is intentionally different from [`WaitGroup::set_error`], which
+    /// acts as a failing `done`. Because the guard already owns the matching
+    /// `done` via its `Drop` impl, this method only writes the error.
+    ///
+    /// The error is sticky; call [`WaitGroup::reset_error`] before reusing
+    /// the `WaitGroup` after a failed `wait`.
     pub fn set_error(&self, err: anyhow::Error) {
         self.inner.set_error(err)
     }
@@ -234,18 +385,18 @@ impl Future for WaitGroupFuture<'_> {
     type Output = Result<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.inner.set_waker(cx.waker().clone());
+        let count = self.inner.count();
+        if count < 0 {
+            return Poll::Ready(Err(anyhow!("err:count < 0 => count:{}", count)));
+        }
+
         if let Some(e) = self.inner.get_error() {
             return Poll::Ready(Err(anyhow!(
                 "err:error => count:{}, err:{}",
                 self.inner.count(),
                 e
             )));
-        }
-
-        self.inner.set_waker(cx.waker().clone());
-        let count = self.inner.count();
-        if count < 0 {
-            return Poll::Ready(Err(anyhow!("err:count < 0 => count:{}", count)));
         }
 
         match count {
