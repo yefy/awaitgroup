@@ -12,6 +12,7 @@ struct Inner {
     count: AtomicI32,
     error: Mutex<Option<Arc<anyhow::Error>>>,
     is_waiting: AtomicBool,
+    is_closing: AtomicBool,
 }
 
 impl Inner {
@@ -21,6 +22,7 @@ impl Inner {
             count: AtomicI32::new(0),
             error: Mutex::new(None),
             is_waiting: AtomicBool::new(false),
+            is_closing: AtomicBool::new(false),
         }
     }
 
@@ -37,7 +39,7 @@ impl Inner {
     }
 
     pub fn add_num(&self, num: usize) {
-        if self.is_waiting.load(Ordering::SeqCst) {
+        if self.is_closing.load(Ordering::SeqCst) {
             panic!("WaitGroup::add called during wait");
         }
         self.count.fetch_add(num as i32, Ordering::SeqCst);
@@ -65,6 +67,10 @@ impl Inner {
         self.is_waiting
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
+    }
+
+    pub fn unlock_waiting(&self) {
+        self.is_waiting.store(false, Ordering::SeqCst);
     }
 
     pub fn set_error(&self, err: anyhow::Error) {
@@ -136,6 +142,8 @@ impl WaitGroup {
         if !self.inner.lock_waiting() {
             panic!("Other threads might still be using it");
         }
+        self.inner.is_closing.store(true, Ordering::SeqCst);
+        scopeguard::defer! { self.inner.unlock_waiting() }
 
         WaitGroupFuture::new(self.inner.clone()).await
     }
@@ -616,6 +624,66 @@ mod tests {
             wi.done();
             assert_eq!(wg.count(), 0);
             assert_wait_ok(&wg).await;
+        });
+    }
+
+    /// `unlock_waiting` runs when `wait` returns, so a later `wait` can take the lock again.
+    #[test]
+    fn test_second_wait_ok_after_unlock() {
+        let rt = current_thread_runtime();
+        rt.block_on(async {
+            let wg = WaitGroup::new();
+            assert_wait_ok(&wg).await;
+            assert_wait_ok(&wg).await;
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "WaitGroup::add called during wait")]
+    fn test_add_during_wait_panics() {
+        let rt = current_thread_runtime();
+        rt.block_on(async {
+            let wg = WaitGroup::new();
+            wg.add();
+
+            let wg2 = wg.clone();
+            let waiter = tokio::spawn(async move {
+                wg2.wait().await.unwrap();
+            });
+
+            tokio::task::yield_now().await;
+            wg.add();
+            let _ = waiter.await;
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "WaitGroup::add called during wait")]
+    fn test_add_after_wait_panics() {
+        let rt = current_thread_runtime();
+        rt.block_on(async {
+            let wg = WaitGroup::new();
+            assert_wait_ok(&wg).await;
+            wg.add();
+        });
+    }
+
+    /// `done` is still allowed while `wait` is pending (only new `add` is blocked).
+    #[test]
+    fn test_done_during_wait_completes() {
+        let rt = current_thread_runtime();
+        rt.block_on(async {
+            let wg = WaitGroup::new();
+            wg.add();
+
+            let wg2 = wg.clone();
+            let waiter = tokio::spawn(async move {
+                wg2.wait().await.unwrap();
+            });
+
+            tokio::task::yield_now().await;
+            wg.done();
+            assert!(waiter.await.is_ok());
         });
     }
 }

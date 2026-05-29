@@ -74,6 +74,10 @@ impl Inner {
             .is_ok()
     }
 
+    pub fn unlock_waiting(&self) {
+        self.is_waiting.store(false, Ordering::SeqCst);
+    }
+
     pub fn set_error(&self, err: anyhow::Error) {
         let mut error = self.error.lock().unwrap();
         if error.is_none() {
@@ -123,9 +127,11 @@ impl WaitGroupArrive {
             panic!("Other threads might still be using it");
         }
 
+        scopeguard::defer! { self.inner.unlock_waiting() }
+
         let old = self.inner.wait_arrive_count_swap(count as i32);
 
-        if old > 0 {
+        if old > 0 && old != count as i32 {
             panic!("Other threads might still be using it");
         }
 
@@ -472,20 +478,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Other threads might still be using it")]
-    fn test_second_wait_arrive_panics() {
-        let rt = current_thread_runtime();
-        rt.block_on(async {
-            let wg = WaitGroupArrive::new();
-            wg.arrive();
-            wg.arrive();
-            wg.arrive();
-            wg.wait_arrive(3).await.unwrap();
-            let _ = wg.wait_arrive(3).await;
-        });
-    }
-
-    #[test]
     #[should_panic(expected = "wait_arrive count <= 0")]
     fn test_wait_arrive_zero_panics() {
         let rt = current_thread_runtime();
@@ -529,6 +521,84 @@ mod tests {
             wg.arrive();
             wg.arrive();
             let _ = waiter.await;
+        });
+    }
+
+    #[test]
+    fn test_wait_arrive_same_target_twice() {
+        let rt = current_thread_runtime();
+        rt.block_on(async {
+            let wg = WaitGroupArrive::new();
+
+            for _ in 0..3 {
+                let wg = wg.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(TASK_DELAY).await;
+                    wg.arrive();
+                });
+            }
+
+            assert_wait_arrive_ok(&wg, 3).await;
+            assert_eq!(wg.count(), 3);
+
+            // Same target again: completes immediately when count is already satisfied.
+            assert_wait_arrive_ok(&wg, 3).await;
+            assert_eq!(wg.count(), 3);
+        });
+    }
+
+    #[test]
+    fn test_wait_arrive_same_target_after_error() {
+        let rt = current_thread_runtime();
+        rt.block_on(async {
+            let wg = WaitGroupArrive::new();
+            wg.arrive_error(anyhow!("sticky error"));
+            assert_wait_arrive_err(&wg, 1).await;
+            assert_wait_arrive_err(&wg, 1).await;
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "Other threads might still be using it")]
+    fn test_wait_arrive_different_target_panics() {
+        let rt = current_thread_runtime();
+        rt.block_on(async {
+            let wg = WaitGroupArrive::new();
+            wg.arrive();
+            wg.arrive();
+            wg.arrive();
+            wg.wait_arrive(3).await.unwrap();
+            let _ = wg.wait_arrive(5).await;
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "Other threads might still be using it")]
+    fn test_arrive_after_wait_arrive_completed_panics() {
+        let rt = current_thread_runtime();
+        rt.block_on(async {
+            let wg = WaitGroupArrive::new();
+            wg.arrive();
+            wg.wait_arrive(1).await.unwrap();
+            wg.arrive();
+        });
+    }
+
+    #[test]
+    fn test_arrive_during_wait_arrive_completes() {
+        let rt = current_thread_runtime();
+        rt.block_on(async {
+            let wg = WaitGroupArrive::new();
+            let wg2 = wg.clone();
+
+            let waiter = tokio::spawn(async move {
+                wg2.wait_arrive(2).await.unwrap();
+            });
+
+            tokio::task::yield_now().await;
+            wg.arrive();
+            wg.arrive();
+            assert!(waiter.await.is_ok());
         });
     }
 }
