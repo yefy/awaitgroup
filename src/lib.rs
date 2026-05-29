@@ -84,7 +84,7 @@
 //!     let wg = wg.clone();
 //!     wg.add();
 //!     tokio::spawn(async move {
-//!         wg.set_error(anyhow!("something went wrong"));
+//!         wg.done_error(anyhow!("something went wrong"));
 //!     });
 //! }
 //!
@@ -108,7 +108,7 @@ use anyhow::Result;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
@@ -141,7 +141,10 @@ impl Inner {
 
     pub fn set_error(&self, err: anyhow::Error) {
         {
-            *self.error.lock().unwrap() = Some(Arc::new(err));
+            let mut error = self.error.lock().unwrap();
+            if error.is_none() {
+                *error = Some(Arc::new(err));
+            }
         }
 
         self.notify();
@@ -182,8 +185,8 @@ impl Inner {
         }
     }
 
-    pub fn add_num(&self, num: i32) {
-        let count = self.count.fetch_add(num, Ordering::SeqCst) + 1;
+    pub fn add_num(&self, num: usize) {
+        let count = self.count.fetch_add(num as i32, Ordering::SeqCst) + num as i32;
         let wait_complete = self.wait_complete();
         if wait_complete > 0 {
             if count > wait_complete {
@@ -279,9 +282,7 @@ impl WaitGroup {
     /// task still releases its slot).
     pub fn guard_add(&self) -> WaitGroupGuard {
         self.add();
-        WaitGroupGuard {
-            inner: self.inner.clone(),
-        }
+        WaitGroupGuard::new(self.inner.clone())
     }
 
     /// Increments the worker count by `1`.
@@ -299,7 +300,7 @@ impl WaitGroup {
     /// (or [`set_error`](Self::set_error)). The caller is responsible for
     /// keeping the running count non-negative; the library does not validate
     /// `num`.
-    pub fn add_num(&self, num: i32) {
+    pub fn add_num(&self, num: usize) {
         self.inner.add_num(num)
     }
 
@@ -365,7 +366,7 @@ impl WaitGroup {
     /// # Panics
     ///
     /// Panics if the count is already `0` (same condition as `done`).
-    pub fn set_error(&self, err: anyhow::Error) {
+    pub fn done_error(&self, err: anyhow::Error) {
         self.inner.set_error(err);
         self.inner.done();
     }
@@ -415,11 +416,12 @@ impl WaitGroup {
 /// `WaitGroup` for this guard's slot.
 pub struct WaitGroupGuard {
     inner: Arc<Inner>,
+    is_done: AtomicBool,
 }
 
 impl Drop for WaitGroupGuard {
     fn drop(&mut self) {
-        self.inner.done()
+        self.done()
     }
 }
 
@@ -433,18 +435,28 @@ impl fmt::Debug for WaitGroupGuard {
 }
 
 impl WaitGroupGuard {
-    /// Records an error on the underlying `WaitGroup` **without** decrementing
-    /// the worker count — the matching decrement happens when this guard is
-    /// dropped.
-    ///
-    /// This is intentionally different from [`WaitGroup::set_error`], which
-    /// acts as a failing `done`. Because the guard already owns the matching
-    /// `done` via its `Drop` impl, this method only writes the error.
-    ///
-    /// The error is sticky; call [`WaitGroup::reset_error`] before reusing
-    /// the `WaitGroup` after a failed `wait`.
-    pub fn set_error(&self, err: anyhow::Error) {
-        self.inner.set_error(err)
+    fn new(inner: Arc<Inner>) -> Self {
+        Self {
+            inner,
+            is_done: AtomicBool::new(false),
+        }
+    }
+
+    fn lock_done(&self) -> bool {
+        self.is_done
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub fn done(&self) {
+        if self.lock_done() {
+            self.inner.done()
+        }
+    }
+
+    pub fn done_error(&self, err: anyhow::Error) {
+        self.inner.set_error(err);
+        self.done();
     }
 }
 
@@ -517,28 +529,27 @@ impl Worker {
     }
     pub fn add(&self) -> WorkerInner {
         self.inner.add();
-        WorkerInner {
-            inner: self.inner.clone(),
-        }
+        WorkerInner::new(self.inner.clone())
+    }
+
+    pub fn guard_add(&self) -> WaitGroupGuard {
+        self.add();
+        WaitGroupGuard::new(self.inner.clone())
     }
 
     pub fn count(&self) -> i32 {
         self.inner.count()
     }
 
-    pub fn error(&self, err: anyhow::Error) {
-        self.set_error(err)
-    }
-
     pub fn set_error(&self, err: anyhow::Error) {
         self.inner.set_error(err);
-        self.inner.done();
     }
 }
 
 ///下面的接口是为了兼容老版本
 pub struct WorkerInner {
     inner: Arc<Inner>,
+    is_done: AtomicBool,
 }
 
 impl fmt::Debug for WorkerInner {
@@ -551,6 +562,13 @@ impl fmt::Debug for WorkerInner {
 }
 
 impl WorkerInner {
+    fn new(inner: Arc<Inner>) -> Self {
+        Self {
+            inner,
+            is_done: AtomicBool::new(false),
+        }
+    }
+
     pub fn worker(&self) -> Worker {
         Worker {
             inner: self.inner.clone(),
@@ -561,17 +579,21 @@ impl WorkerInner {
         self.inner.count()
     }
 
+    fn lock_done(&self) -> bool {
+        self.is_done
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
     pub fn done(&self) {
-        self.inner.done()
+        if self.lock_done() {
+            self.inner.done()
+        }
     }
 
-    pub fn error(&self, err: anyhow::Error) {
-        self.set_error(err)
-    }
-
-    pub fn set_error(&self, err: anyhow::Error) {
+    pub fn done_error(&self, err: anyhow::Error) {
         self.inner.set_error(err);
-        self.inner.done();
+        self.done();
     }
 }
 
@@ -624,7 +646,7 @@ mod tests {
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     if i == 3 {
-                        wg.set_error(anyhow!("error: i == 3"));
+                        wg.done_error(anyhow!("error: i == 3"));
                     } else {
                         wg.done();
                     }
@@ -723,7 +745,7 @@ mod tests {
                         let wgg = wgg;
                         tokio::time::sleep(Duration::from_secs(1)).await;
                         if i == 3 {
-                            wgg.set_error(anyhow!("error: i == 3"));
+                            wgg.done_error(anyhow!("error: i == 3"));
                         }
                     });
                     wg.done();
@@ -783,7 +805,7 @@ mod tests {
                 tokio::spawn(async move {
                     wg.add();
                     if i == 3 {
-                        wg.set_error(anyhow!("error: i == 3"));
+                        wg.done_error(anyhow!("error: i == 3"));
                     }
                 });
             }
@@ -837,7 +859,7 @@ mod tests {
                 tokio::spawn(async move {
                     let inner = worker.add();
                     if i == 3 {
-                        inner.set_error(anyhow!("error: i == 3"));
+                        inner.done_error(anyhow!("error: i == 3"));
                     }
                 });
             }
@@ -864,7 +886,7 @@ mod tests {
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     if i == 1 {
-                        wg.set_error(anyhow!("round 1 error"));
+                        wg.done_error(anyhow!("round 1 error"));
                     } else {
                         wg.done();
                     }
