@@ -91,7 +91,7 @@
 //! assert!(wg.wait().await.is_err());
 //!
 //! // Clear the sticky error before reusing.
-//! wg.reset_error();
+//! wg.reset();
 //!
 //! let wgg = wg.guard_add();
 //! tokio::spawn(async move {
@@ -117,6 +117,7 @@ struct Inner {
     count: AtomicI32,
     error: Mutex<Option<Arc<anyhow::Error>>>,
     wait_complete: AtomicI32,
+    is_waiting: AtomicBool,
 }
 
 impl Inner {
@@ -126,6 +127,7 @@ impl Inner {
             count: AtomicI32::new(0),
             error: Mutex::new(None),
             wait_complete: AtomicI32::new(0),
+            is_waiting: AtomicBool::new(false),
         }
     }
 
@@ -150,11 +152,8 @@ impl Inner {
         self.notify();
     }
 
-    pub fn reset_error(&self) {
-        *self.error.lock().unwrap() = None;
-    }
-
     pub fn reset(&self) {
+        self.is_waiting.store(false, Ordering::SeqCst);
         *self.error.lock().unwrap() = None;
         let wait_complete = self.wait_complete.swap(0, Ordering::SeqCst);
         let count = self.count.swap(0, Ordering::SeqCst);
@@ -218,6 +217,12 @@ impl Inner {
 
     pub fn wait_complete_swap(&self, value: i32) -> i32 {
         self.wait_complete.swap(value, Ordering::SeqCst)
+    }
+
+    fn lock_waiting(&self) -> bool {
+        self.is_waiting
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 }
 
@@ -338,11 +343,16 @@ impl WaitGroup {
     /// so earlier waiters can be stuck forever. See the
     /// [type-level invariants](Self#invariants-callers-responsibility).
     pub async fn wait(&self) -> Result<()> {
+        if !self.inner.lock_waiting() {
+            panic!("Other threads might still be using it")
+        }
         let wait_complete = self.inner.wait_complete_swap(0);
         if wait_complete != 0 {
             panic!("Other threads might still be using it.")
         }
-        WaitGroupFuture::new(&self.inner).await
+        let ret = WaitGroupFuture::new(&self.inner).await;
+        self.inner.is_waiting.store(false, Ordering::SeqCst);
+        ret
     }
 
     /// Returns the current worker count.
@@ -371,10 +381,6 @@ impl WaitGroup {
         self.inner.done();
     }
 
-    pub fn reset_error(&self) {
-        self.inner.reset_error();
-    }
-
     pub fn reset(&self) {
         self.inner.reset();
     }
@@ -393,11 +399,17 @@ impl WaitGroup {
     /// before the next round when `count` still equals the `wait_complete`
     /// target from the last call.
     pub async fn wait_complete(&self, count: usize) -> Result<()> {
+        if !self.inner.lock_waiting() {
+            panic!("Other threads might still be using it")
+        }
+
         let wait_complete = self.inner.wait_complete_swap(count as i32);
         if wait_complete > 0 && wait_complete != count as i32 {
             panic!("Other threads might still be using it.")
         }
-        WaitGroupFuture::new(&self.inner).await
+        let ret = WaitGroupFuture::new(&self.inner).await;
+        self.inner.is_waiting.store(false, Ordering::SeqCst);
+        ret
     }
 }
 
