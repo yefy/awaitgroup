@@ -116,8 +116,8 @@ struct Inner {
     waker: Mutex<Option<Waker>>,
     count: AtomicI32,
     error: Mutex<Option<Arc<anyhow::Error>>>,
-    wait_complete: AtomicI32,
-    is_waiting: AtomicBool,
+    wait_arrive_count: AtomicI32,
+    is_waiting: Arc<AtomicBool>,
 }
 
 impl Inner {
@@ -126,8 +126,8 @@ impl Inner {
             waker: Mutex::new(None),
             count: AtomicI32::new(0),
             error: Mutex::new(None),
-            wait_complete: AtomicI32::new(0),
-            is_waiting: AtomicBool::new(false),
+            wait_arrive_count: AtomicI32::new(0),
+            is_waiting: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -141,24 +141,17 @@ impl Inner {
         }
     }
 
-    pub fn set_error(&self, err: anyhow::Error) {
-        {
-            let mut error = self.error.lock().unwrap();
-            if error.is_none() {
-                *error = Some(Arc::new(err));
-            }
-        }
-
-        self.notify();
-    }
-
     pub fn reset(&self) {
+        let is_waiting = self.is_waiting.load(Ordering::SeqCst);
+        if is_waiting {
+            panic!("Other threads might still be using it")
+        }
         self.is_waiting.store(false, Ordering::SeqCst);
         *self.error.lock().unwrap() = None;
-        let wait_complete = self.wait_complete.swap(0, Ordering::SeqCst);
+        let wait_arrive_count = self.wait_arrive_count.swap(0, Ordering::SeqCst);
         let count = self.count.swap(0, Ordering::SeqCst);
-        if wait_complete > 0 {
-            if count != wait_complete {
+        if wait_arrive_count > 0 {
+            if count != wait_arrive_count {
                 panic!("Other threads might still be using it")
             }
         } else {
@@ -174,11 +167,11 @@ impl Inner {
 
     pub fn add(&self) {
         let count = self.count.fetch_add(1, Ordering::SeqCst) + 1;
-        let wait_complete = self.wait_complete();
-        if wait_complete > 0 {
-            if count > wait_complete {
+        let wait_arrive_count = self.wait_arrive_count();
+        if wait_arrive_count > 0 {
+            if count > wait_arrive_count {
                 panic!("Other threads might still be using it")
-            } else if count == wait_complete {
+            } else if count == wait_arrive_count {
                 self.notify();
             }
         }
@@ -186,11 +179,11 @@ impl Inner {
 
     pub fn add_num(&self, num: usize) {
         let count = self.count.fetch_add(num as i32, Ordering::SeqCst) + num as i32;
-        let wait_complete = self.wait_complete();
-        if wait_complete > 0 {
-            if count > wait_complete {
+        let wait_arrive_count = self.wait_arrive_count();
+        if wait_arrive_count > 0 {
+            if count > wait_arrive_count {
                 panic!("Other threads might still be using it")
-            } else if count == wait_complete {
+            } else if count == wait_arrive_count {
                 self.notify();
             }
         }
@@ -211,12 +204,12 @@ impl Inner {
         self.count.load(Ordering::SeqCst)
     }
 
-    pub fn wait_complete(&self) -> i32 {
-        self.wait_complete.load(Ordering::SeqCst)
+    pub fn wait_arrive_count(&self) -> i32 {
+        self.wait_arrive_count.load(Ordering::SeqCst)
     }
 
-    pub fn wait_complete_swap(&self, value: i32) -> i32 {
-        self.wait_complete.swap(value, Ordering::SeqCst)
+    pub fn wait_arrive_count_swap(&self, value: i32) -> i32 {
+        self.wait_arrive_count.swap(value, Ordering::SeqCst)
     }
 
     fn lock_waiting(&self) -> bool {
@@ -224,34 +217,16 @@ impl Inner {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
+
+    pub fn set_error(&self, err: anyhow::Error) {
+        let mut error = self.error.lock().unwrap();
+        if error.is_none() {
+            *error = Some(Arc::new(err));
+        }
+    }
 }
 
-/// Wait for a collection of tasks to finish execution.
-///
-/// Refer to the [crate level documentation](crate) for examples.
-///
-/// # Invariants (caller's responsibility)
-///
-/// The library performs no bookkeeping beyond a single atomic counter and a
-/// single waker slot. The caller is responsible for upholding the following
-/// invariants — violating them leads to panics, deadlocks, or lost errors:
-///
-/// 1. **Balanced add/done.** Every [`add`](Self::add) / [`add_num`](Self::add_num)
-///    / [`guard_add`](Self::guard_add) must be balanced by **exactly one**
-///    matching [`done`](Self::done) / [`set_error`](Self::set_error) /
-///    [`WaitGroupGuard`] drop. Calling `done` (or `set_error`) more times than
-///    `add` will panic; calling fewer times will make [`wait`](Self::wait)
-///    hang forever.
-/// 2. **Never `done` and `set_error` for the same worker.**
-///    [`set_error`](Self::set_error) internally performs one `done`, so each
-///    worker must call **either** `done` **or** `set_error`, not both.
-/// 3. **Single waiter.** At most one task may be in [`wait`](Self::wait) at a
-///    time. Concurrent waiters are **not** supported — only the most recently
-///    registered waker is kept, so earlier waiters may be stuck forever.
-/// 4. **Reset before reuse after error.** Once any worker calls `set_error`,
-///    the error is sticky and every subsequent `wait` returns `Err`. Call
-///    [`reset_error`](Self::reset_error) before reusing the `WaitGroup` for a
-///    new round of work.
+//wait wait_arrive reset 不能多线程使用, 不要在考虑多线程问题了, 没完没了的, 只能在一个线程用, 用户自己保证
 #[derive(Clone)]
 pub struct WaitGroup {
     inner: Arc<Inner>,
@@ -274,158 +249,93 @@ impl fmt::Debug for WaitGroup {
 
 #[allow(clippy::new_without_default)]
 impl WaitGroup {
-    /// Creates a new `WaitGroup` with an initial count of `0`.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Atomically increments the worker count by `1` and returns a
-    /// [`WaitGroupGuard`] that decrements the count back when dropped.
-    ///
-    /// Prefer this over the manual [`add`](Self::add) + [`done`](Self::done)
-    /// pair when you want RAII semantics (e.g. so a panicking or cancelled
-    /// task still releases its slot).
     pub fn guard_add(&self) -> WaitGroupGuard {
         self.add();
         WaitGroupGuard::new(self.inner.clone())
     }
 
-    /// Increments the worker count by `1`.
-    ///
-    /// Must be paired with **exactly one** later call to [`done`](Self::done)
-    /// or [`set_error`](Self::set_error). See the
-    /// [type-level invariants](Self#invariants-callers-responsibility).
     pub fn add(&self) {
         self.inner.add();
     }
 
-    /// Increments the worker count by `num`.
-    ///
-    /// Must be paired with exactly `num` later calls to [`done`](Self::done)
-    /// (or [`set_error`](Self::set_error)). The caller is responsible for
-    /// keeping the running count non-negative; the library does not validate
-    /// `num`.
     pub fn add_num(&self, num: usize) {
         self.inner.add_num(num)
     }
 
-    /// Decrements the worker count by `1` and notifies the current waiter if
-    /// the count reaches `0`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the count is already `0` (i.e. `done` has been called more
-    /// times than `add`). See the
-    /// [type-level invariants](Self#invariants-callers-responsibility).
     pub fn done(&self) {
         self.inner.done()
     }
 
-    /// Waits until the worker count reaches `0` (or an error is reported).
-    ///
-    /// Use with the **add → done** pattern: each worker calls [`add`](Self::add)
-    /// (or [`guard_add`](Self::guard_add)) when it starts, and [`done`](Self::done)
-    /// when it finishes. `wait` returns `Ok` once every `add` has a matching
-    /// `done` and the count is back to zero.
-    ///
-    /// # Returns
-    ///
-    /// - `Ok(())` once all workers have called `done` and no error has been
-    ///   recorded.
-    /// - `Err(_)` if any worker called `set_error`. The error is **sticky**;
-    ///   call [`reset_error`](Self::reset_error) before reusing this
-    ///   `WaitGroup` for a new round of work.
-    ///
-    /// # Concurrency
-    ///
-    /// Only **one** task may be inside `wait` at a time. Concurrent waiters
-    /// are not supported — only the most recently registered waker is kept,
-    /// so earlier waiters can be stuck forever. See the
-    /// [type-level invariants](Self#invariants-callers-responsibility).
-    pub async fn wait(&self) -> Result<()> {
-        if !self.inner.lock_waiting() {
-            panic!("Other threads might still be using it")
-        }
-        let wait_complete = self.inner.wait_complete_swap(0);
-        if wait_complete != 0 {
-            panic!("Other threads might still be using it.")
-        }
-        let ret = WaitGroupFuture::new(&self.inner).await;
-        self.inner.is_waiting.store(false, Ordering::SeqCst);
-        ret
-    }
-
-    /// Returns the current worker count.
-    ///
-    /// This is informational and inherently racy — by the time the caller
-    /// inspects the value, other threads may have changed it.
     pub fn count(&self) -> i32 {
         self.inner.count()
     }
 
-    /// Records an error and decrements the worker count by `1` (acts as a
-    /// failing [`done`](Self::done)).
-    ///
-    /// A worker must call **either** `done` **or** `set_error`, never both —
-    /// `set_error` already performs one `done` internally. Calling both will
-    /// over-decrement the count and eventually panic.
-    ///
-    /// The error is sticky: once set, every subsequent [`wait`](Self::wait)
-    /// returns `Err` until [`reset_error`](Self::reset_error) is called.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the count is already `0` (same condition as `done`).
     pub fn done_error(&self, err: anyhow::Error) {
         self.inner.set_error(err);
-        self.inner.done();
+        self.done();
+        self.inner.notify();
+    }
+
+    //等待结束使用: add add_num done done_error wait
+    pub async fn wait(&self) -> Result<()> {
+        let is_waiting = self.inner.is_waiting.clone();
+        scopeguard::defer! {
+            is_waiting.store(false, Ordering::SeqCst);
+        };
+        if !self.inner.lock_waiting() {
+            panic!("Other threads might still be using it")
+        }
+        let wait_arrive_count = self.inner.wait_arrive_count_swap(0);
+        if wait_arrive_count != 0 {
+            panic!("Other threads might still be using it.")
+        }
+        WaitGroupFuture::new(&self.inner).await
     }
 
     pub fn reset(&self) {
         self.inner.reset();
     }
 
-    /// Legacy API: obtain a [`Worker`] handle for the add-only registration path.
-    pub fn worker(&self) -> Worker {
-        Worker {
+    ///下面的接口是为了兼容老版本
+    pub fn worker(&self) -> WaitGroupWorker {
+        WaitGroupWorker {
             inner: self.inner.clone(),
         }
     }
 
-    /// Legacy API: wait until `count` workers have called [`add`](Self::add).
-    ///
-    /// Unlike [`wait`](Self::wait), this does **not** require [`done`](Self::done).
-    /// It returns once the worker count reaches `count`. Call [`reset`](Self::reset)
-    /// before the next round when `count` still equals the `wait_complete`
-    /// target from the last call.
-    pub async fn wait_complete(&self, count: usize) -> Result<()> {
+    pub fn arrive(&self) {
+        self.inner.add();
+    }
+
+    pub fn arrive_error(&self, err: anyhow::Error) {
+        self.inner.set_error(err);
+        self.inner.add();
+        self.inner.notify();
+    }
+
+    //等待完成使用: arrive arrive_error wait_arrive
+    pub async fn wait_arrive(&self, count: usize) -> Result<()> {
+        let is_waiting = self.inner.is_waiting.clone();
+        scopeguard::defer! {
+            is_waiting.store(false, Ordering::SeqCst);
+        };
+
         if !self.inner.lock_waiting() {
             panic!("Other threads might still be using it")
         }
 
-        let wait_complete = self.inner.wait_complete_swap(count as i32);
-        if wait_complete > 0 && wait_complete != count as i32 {
+        let wait_arrive_count = self.inner.wait_arrive_count_swap(count as i32);
+        if wait_arrive_count > 0 && wait_arrive_count != count as i32 {
             panic!("Other threads might still be using it.")
         }
-        let ret = WaitGroupFuture::new(&self.inner).await;
-        self.inner.is_waiting.store(false, Ordering::SeqCst);
-        ret
+        WaitGroupFuture::new(&self.inner).await
     }
 }
 
-/// RAII handle returned by [`WaitGroup::guard_add`].
-///
-/// Dropping the guard decrements the underlying worker count by `1`,
-/// equivalent to calling [`WaitGroup::done`]. This makes it convenient to
-/// pair an `add` with its matching `done` even in the presence of early
-/// returns, cancellations, or panics.
-///
-/// # Panics
-///
-/// `Drop` calls `done` internally, which panics if the count is already `0`.
-/// This should never happen under normal use (each guard owns exactly one
-/// slot) unless the caller has manually called `done`/`set_error` on the
-/// `WaitGroup` for this guard's slot.
 pub struct WaitGroupGuard {
     inner: Arc<Inner>,
     is_done: AtomicBool,
@@ -469,6 +379,7 @@ impl WaitGroupGuard {
     pub fn done_error(&self, err: anyhow::Error) {
         self.inner.set_error(err);
         self.done();
+        self.inner.notify();
     }
 }
 
@@ -491,12 +402,12 @@ impl Future for WaitGroupFuture<'_> {
         if count < 0 {
             return Poll::Ready(Err(anyhow!("err:count < 0 => count:{}", count)));
         }
-        let wait_complete = self.inner.wait_complete();
-        if wait_complete > 0 && count > wait_complete {
+        let wait_arrive_count = self.inner.wait_arrive_count();
+        if wait_arrive_count > 0 && count > wait_arrive_count {
             return Poll::Ready(Err(anyhow!(
-                "err:count:{} > wait_complete:{}",
+                "err:count:{} > wait_arrive_count:{}",
                 count,
-                wait_complete
+                wait_arrive_count
             )));
         }
 
@@ -508,7 +419,7 @@ impl Future for WaitGroupFuture<'_> {
             )));
         }
 
-        if count == wait_complete {
+        if count == wait_arrive_count {
             Poll::Ready(Ok(()))
         } else {
             Poll::Pending
@@ -517,35 +428,34 @@ impl Future for WaitGroupFuture<'_> {
 }
 
 ///下面的接口是为了兼容老版本
-/// A worker registered in a `WaitGroup`.
-///
-/// Refer to the [crate level documentation](crate) for details.
 #[derive(Clone)]
-pub struct Worker {
+pub struct WaitGroupWorker {
     inner: Arc<Inner>,
 }
 
-impl fmt::Debug for Worker {
+impl fmt::Debug for WaitGroupWorker {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let count = self.inner.count();
         f.debug_struct("Worker").field("count", &count).finish()
     }
 }
 
-impl Worker {
-    /// Notify the `WaitGroup` that this worker has finished execution.
-    pub fn worker(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-        }
+impl WaitGroupWorker {
+    fn new(inner: Arc<Inner>) -> Self {
+        Self { inner }
     }
-    pub fn add(&self) -> WorkerInner {
+
+    pub fn worker(&self) -> Self {
+        Self::new(self.inner.clone())
+    }
+
+    pub fn add(&self) -> WaitGroupInner {
         self.inner.add();
-        WorkerInner::new(self.inner.clone())
+        WaitGroupInner::new(self.inner.clone())
     }
 
     pub fn guard_add(&self) -> WaitGroupGuard {
-        self.add();
+        self.inner.add();
         WaitGroupGuard::new(self.inner.clone())
     }
 
@@ -553,18 +463,24 @@ impl Worker {
         self.inner.count()
     }
 
-    pub fn set_error(&self, err: anyhow::Error) {
+    pub fn arrive(&self) {
+        self.inner.add();
+    }
+
+    pub fn arrive_error(&self, err: anyhow::Error) {
         self.inner.set_error(err);
+        self.inner.add();
+        self.inner.notify();
     }
 }
 
 ///下面的接口是为了兼容老版本
-pub struct WorkerInner {
+pub struct WaitGroupInner {
     inner: Arc<Inner>,
     is_done: AtomicBool,
 }
 
-impl fmt::Debug for WorkerInner {
+impl fmt::Debug for WaitGroupInner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let count = self.inner.count();
         f.debug_struct("WorkerInner")
@@ -573,7 +489,7 @@ impl fmt::Debug for WorkerInner {
     }
 }
 
-impl WorkerInner {
+impl WaitGroupInner {
     fn new(inner: Arc<Inner>) -> Self {
         Self {
             inner,
@@ -581,10 +497,8 @@ impl WorkerInner {
         }
     }
 
-    pub fn worker(&self) -> Worker {
-        Worker {
-            inner: self.inner.clone(),
-        }
+    pub fn worker(&self) -> WaitGroupWorker {
+        WaitGroupWorker::new(self.inner.clone())
     }
 
     pub fn count(&self) -> i32 {
@@ -606,6 +520,7 @@ impl WorkerInner {
     pub fn done_error(&self, err: anyhow::Error) {
         self.inner.set_error(err);
         self.done();
+        self.inner.notify();
     }
 }
 
@@ -639,6 +554,8 @@ mod tests {
             assert!(ret.is_ok());
             let ret = ret.unwrap();
             assert!(ret.is_ok());
+
+            wg.reset();
         });
     }
 
@@ -669,6 +586,8 @@ mod tests {
             assert!(ret.is_ok());
             let ret = ret.unwrap();
             assert!(ret.is_err());
+
+            wg.reset();
         });
     }
 
@@ -705,6 +624,8 @@ mod tests {
             assert!(ret.is_ok());
             let ret = ret.unwrap();
             assert!(ret.is_ok());
+
+            wg.reset();
         });
     }
 
@@ -735,6 +656,8 @@ mod tests {
             assert!(ret.is_ok());
             let ret = ret.unwrap();
             assert!(ret.is_ok());
+
+            wg.reset();
         });
     }
 
@@ -768,6 +691,8 @@ mod tests {
             assert!(ret.is_ok());
             let ret = ret.unwrap();
             assert!(ret.is_err());
+
+            wg.reset();
         });
     }
 
@@ -790,22 +715,24 @@ mod tests {
                 let wg = wg.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(50)).await;
-                    wg.add();
+                    wg.arrive();
                 });
             }
 
             let ret =
-                tokio::time::timeout(tokio::time::Duration::from_secs(10), wg.wait_complete(5))
-                    .await;
+                tokio::time::timeout(tokio::time::Duration::from_secs(10), wg.wait_arrive(5)).await;
             assert!(ret.is_ok());
             let ret = ret.unwrap();
             assert!(ret.is_ok());
 
             assert_eq!(wg.count(), 5);
+
+            wg.reset();
         });
     }
 
     #[test]
+    #[should_panic]
     fn test_wait_complete_error() {
         let rt = current_thread_runtime();
 
@@ -815,19 +742,49 @@ mod tests {
             for i in 0..5 {
                 let wg = wg.clone();
                 tokio::spawn(async move {
-                    wg.add();
                     if i == 3 {
                         wg.done_error(anyhow!("error: i == 3"));
+                    } else {
+                        wg.add();
                     }
                 });
             }
 
             let ret =
-                tokio::time::timeout(tokio::time::Duration::from_secs(10), wg.wait_complete(5))
-                    .await;
+                tokio::time::timeout(tokio::time::Duration::from_secs(10), wg.wait_arrive(5)).await;
             assert!(ret.is_ok());
             let ret = ret.unwrap();
             assert!(ret.is_err());
+
+            wg.reset();
+        });
+    }
+
+    #[test]
+    fn test_wait_complete_ok() {
+        let rt = current_thread_runtime();
+
+        rt.block_on(async {
+            let wg = WaitGroup::new();
+
+            for i in 0..5 {
+                let wg = wg.clone();
+                tokio::spawn(async move {
+                    if i == 3 {
+                        wg.arrive_error(anyhow!("error: i == 3"));
+                    } else {
+                        wg.add();
+                    }
+                });
+            }
+
+            let ret =
+                tokio::time::timeout(tokio::time::Duration::from_secs(10), wg.wait_arrive(5)).await;
+            assert!(ret.is_ok());
+            let ret = ret.unwrap();
+            assert!(ret.is_err());
+
+            wg.reset();
         });
     }
 
@@ -843,22 +800,24 @@ mod tests {
                 let worker = worker.worker();
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(50)).await;
-                    let _inner = worker.add();
+                    let _inner = worker.arrive();
                 });
             }
 
             let ret =
-                tokio::time::timeout(tokio::time::Duration::from_secs(10), wg.wait_complete(5))
-                    .await;
+                tokio::time::timeout(tokio::time::Duration::from_secs(10), wg.wait_arrive(5)).await;
             assert!(ret.is_ok());
             let ret = ret.unwrap();
             assert!(ret.is_ok());
 
             assert_eq!(worker.count(), 5);
+
+            wg.reset();
         });
     }
 
     #[test]
+    #[should_panic]
     fn test_worker_wait_complete_error() {
         let rt = current_thread_runtime();
 
@@ -869,19 +828,21 @@ mod tests {
             for i in 0..5 {
                 let worker = worker.worker();
                 tokio::spawn(async move {
-                    let inner = worker.add();
                     if i == 3 {
-                        inner.done_error(anyhow!("error: i == 3"));
+                        worker.add().done_error(anyhow!("error: i == 3"));
+                    } else {
+                        worker.arrive()
                     }
                 });
             }
 
             let ret =
-                tokio::time::timeout(tokio::time::Duration::from_secs(10), wg.wait_complete(5))
-                    .await;
+                tokio::time::timeout(tokio::time::Duration::from_secs(10), wg.wait_arrive(5)).await;
             assert!(ret.is_ok());
             let ret = ret.unwrap();
             assert!(ret.is_err());
+
+            wg.reset();
         });
     }
 
@@ -927,6 +888,8 @@ mod tests {
             assert!(ret.is_ok());
             let ret = ret.unwrap();
             assert!(ret.is_ok());
+
+            wg.reset();
         });
     }
 
@@ -940,13 +903,12 @@ mod tests {
             for _ in 0..3 {
                 let wg = wg.clone();
                 tokio::spawn(async move {
-                    wg.add();
+                    wg.arrive();
                 });
             }
 
             let ret =
-                tokio::time::timeout(tokio::time::Duration::from_secs(10), wg.wait_complete(3))
-                    .await;
+                tokio::time::timeout(tokio::time::Duration::from_secs(10), wg.wait_arrive(3)).await;
             assert!(ret.is_ok());
             let ret = ret.unwrap();
             assert!(ret.is_ok());
@@ -957,18 +919,19 @@ mod tests {
             for _ in 0..3 {
                 let wg = wg.clone();
                 tokio::spawn(async move {
-                    wg.add();
+                    wg.arrive();
                 });
             }
 
             let ret =
-                tokio::time::timeout(tokio::time::Duration::from_secs(10), wg.wait_complete(3))
-                    .await;
+                tokio::time::timeout(tokio::time::Duration::from_secs(10), wg.wait_arrive(3)).await;
             assert!(ret.is_ok());
             let ret = ret.unwrap();
             assert!(ret.is_ok());
 
             assert_eq!(wg.count(), 3);
+
+            wg.reset();
         });
     }
 
@@ -993,6 +956,8 @@ mod tests {
             assert!(ret.is_ok());
             let ret = ret.unwrap();
             assert!(ret.is_ok());
+
+            wg.reset();
         });
     }
 
@@ -1002,14 +967,14 @@ mod tests {
 
         rt.block_on(async {
             let wg = WaitGroup::new();
-            let wk = wg.worker();
+            let wgw = wg.worker();
 
             for _ in 0..5 {
-                let wi = wk.add();
+                let wgi = wgw.add();
 
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_secs(5)).await;
-                    wi.done();
+                    wgi.done();
                 });
             }
 
@@ -1017,19 +982,22 @@ mod tests {
             assert!(ret.is_ok());
             let ret = ret.unwrap();
             assert!(ret.is_ok());
+            wg.reset();
 
-            let wk = wg.worker();
-            let wi = wk.add();
+            let wgw = wg.worker();
+            let wgi = wgw.add();
 
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(5)).await;
-                wi.done();
+                wgi.done();
             });
 
             let ret = tokio::time::timeout(tokio::time::Duration::from_secs(10), wg.wait()).await;
             assert!(ret.is_ok());
             let ret = ret.unwrap();
             assert!(ret.is_ok());
+
+            wg.reset();
         });
     }
 
@@ -1039,17 +1007,17 @@ mod tests {
 
         rt.block_on(async {
             let wg = WaitGroup::new();
-            let wk = wg.worker();
+            let wgw = wg.worker();
 
             for _ in 0..5 {
-                let wi = wk.worker().add();
+                let wgi = wgw.worker().add();
 
                 tokio::spawn(async move {
-                    let nested_wi = wi.worker().add();
+                    let nested_wgi = wgi.worker().add();
                     tokio::spawn(async move {
-                        nested_wi.done();
+                        nested_wgi.done();
                     });
-                    wi.done();
+                    wgi.done();
                 });
             }
 
@@ -1057,6 +1025,8 @@ mod tests {
             assert!(ret.is_ok());
             let ret = ret.unwrap();
             assert!(ret.is_ok());
+
+            wg.reset();
         });
     }
 }
