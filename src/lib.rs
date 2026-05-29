@@ -147,7 +147,6 @@ impl Inner {
         self.notify();
     }
 
-
     pub fn reset_error(&self) {
         *self.error.lock().unwrap() = None;
     }
@@ -170,7 +169,6 @@ impl Inner {
     pub fn get_error(&self) -> Option<Arc<anyhow::Error>> {
         self.error.lock().unwrap().clone()
     }
-
 
     pub fn add(&self) {
         let count = self.count.fetch_add(1, Ordering::SeqCst) + 1;
@@ -471,7 +469,11 @@ impl Future for WaitGroupFuture<'_> {
         }
         let wait_complete = self.inner.wait_complete();
         if wait_complete > 0 && count > wait_complete {
-            return Poll::Ready(Err(anyhow!("err:count:{} > wait_complete:{}", count, wait_complete)));
+            return Poll::Ready(Err(anyhow!(
+                "err:count:{} > wait_complete:{}",
+                count,
+                wait_complete
+            )));
         }
 
         if let Some(e) = self.inner.get_error() {
@@ -489,7 +491,6 @@ impl Future for WaitGroupFuture<'_> {
         }
     }
 }
-
 
 ///下面的接口是为了兼容老版本
 /// A worker registered in a `WaitGroup`.
@@ -526,7 +527,7 @@ impl Worker {
     }
 
     pub fn error(&self, err: anyhow::Error) {
-       self.set_error(err)
+        self.set_error(err)
     }
 
     pub fn set_error(&self, err: anyhow::Error) {
@@ -543,7 +544,9 @@ pub struct WorkerInner {
 impl fmt::Debug for WorkerInner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let count = self.inner.count();
-        f.debug_struct("WorkerInner").field("count", &count).finish()
+        f.debug_struct("WorkerInner")
+            .field("count", &count)
+            .finish()
     }
 }
 
@@ -572,8 +575,6 @@ impl WorkerInner {
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -600,7 +601,9 @@ mod tests {
                 });
             }
 
-            let ret = wg.wait().await;
+            let ret = tokio::time::timeout(tokio::time::Duration::from_secs(10), wg.wait()).await;
+            assert!(ret.is_ok());
+            let ret = ret.unwrap();
             assert!(ret.is_ok());
         });
     }
@@ -628,7 +631,9 @@ mod tests {
                 });
             }
 
-            let ret = wg.wait().await;
+            let ret = tokio::time::timeout(tokio::time::Duration::from_secs(10), wg.wait()).await;
+            assert!(ret.is_ok());
+            let ret = ret.unwrap();
             assert!(ret.is_err());
         });
     }
@@ -651,7 +656,9 @@ mod tests {
                 });
             }
 
-            let ret = wg.wait().await;
+            let ret = tokio::time::timeout(tokio::time::Duration::from_secs(10), wg.wait()).await;
+            assert!(ret.is_ok());
+            let ret = ret.unwrap();
             assert!(ret.is_ok());
 
             let wgg = wg.guard_add();
@@ -660,7 +667,9 @@ mod tests {
                 drop(wgg);
             });
 
-            let ret = wg.wait().await;
+            let ret = tokio::time::timeout(tokio::time::Duration::from_secs(10), wg.wait()).await;
+            assert!(ret.is_ok());
+            let ret = ret.unwrap();
             assert!(ret.is_ok());
         });
     }
@@ -688,7 +697,9 @@ mod tests {
                 });
             }
 
-            let ret = wg.wait().await;
+            let ret = tokio::time::timeout(tokio::time::Duration::from_secs(10), wg.wait()).await;
+            assert!(ret.is_ok());
+            let ret = ret.unwrap();
             assert!(ret.is_ok());
         });
     }
@@ -719,7 +730,9 @@ mod tests {
                 });
             }
 
-            let ret = wg.wait().await;
+            let ret = tokio::time::timeout(tokio::time::Duration::from_secs(10), wg.wait()).await;
+            assert!(ret.is_ok());
+            let ret = ret.unwrap();
             assert!(ret.is_err());
         });
     }
@@ -747,8 +760,13 @@ mod tests {
                 });
             }
 
-            let ret = wg.wait_complete(5).await;
+            let ret =
+                tokio::time::timeout(tokio::time::Duration::from_secs(10), wg.wait_complete(5))
+                    .await;
             assert!(ret.is_ok());
+            let ret = ret.unwrap();
+            assert!(ret.is_ok());
+
             assert_eq!(wg.count(), 5);
         });
     }
@@ -770,7 +788,11 @@ mod tests {
                 });
             }
 
-            let ret = wg.wait_complete(5).await;
+            let ret =
+                tokio::time::timeout(tokio::time::Duration::from_secs(10), wg.wait_complete(5))
+                    .await;
+            assert!(ret.is_ok());
+            let ret = ret.unwrap();
             assert!(ret.is_err());
         });
     }
@@ -791,8 +813,13 @@ mod tests {
                 });
             }
 
-            let ret = wg.wait_complete(5).await;
+            let ret =
+                tokio::time::timeout(tokio::time::Duration::from_secs(10), wg.wait_complete(5))
+                    .await;
             assert!(ret.is_ok());
+            let ret = ret.unwrap();
+            assert!(ret.is_ok());
+
             assert_eq!(worker.count(), 5);
         });
     }
@@ -815,7 +842,11 @@ mod tests {
                 });
             }
 
-            let ret = wg.wait_complete(5).await;
+            let ret =
+                tokio::time::timeout(tokio::time::Duration::from_secs(10), wg.wait_complete(5))
+                    .await;
+            assert!(ret.is_ok());
+            let ret = ret.unwrap();
             assert!(ret.is_err());
         });
     }
@@ -840,7 +871,10 @@ mod tests {
                 });
             }
 
-            assert!(wg.wait().await.is_err());
+            let ret = tokio::time::timeout(tokio::time::Duration::from_secs(10), wg.wait()).await;
+            assert!(ret.is_ok());
+            let ret = ret.unwrap();
+            assert!(ret.is_err());
 
             // All workers finished; count is 0 — safe to reset.
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -855,7 +889,10 @@ mod tests {
                 });
             }
 
-            assert!(wg.wait().await.is_ok());
+            let ret = tokio::time::timeout(tokio::time::Duration::from_secs(10), wg.wait()).await;
+            assert!(ret.is_ok());
+            let ret = ret.unwrap();
+            assert!(ret.is_ok());
         });
     }
 
@@ -873,7 +910,13 @@ mod tests {
                 });
             }
 
-            assert!(wg.wait_complete(3).await.is_ok());
+            let ret =
+                tokio::time::timeout(tokio::time::Duration::from_secs(10), wg.wait_complete(3))
+                    .await;
+            assert!(ret.is_ok());
+            let ret = ret.unwrap();
+            assert!(ret.is_ok());
+
             assert_eq!(wg.count(), 3);
             wg.reset();
 
@@ -884,8 +927,102 @@ mod tests {
                 });
             }
 
-            assert!(wg.wait_complete(3).await.is_ok());
+            let ret =
+                tokio::time::timeout(tokio::time::Duration::from_secs(10), wg.wait_complete(3))
+                    .await;
+            assert!(ret.is_ok());
+            let ret = ret.unwrap();
+            assert!(ret.is_ok());
+
             assert_eq!(wg.count(), 3);
+        });
+    }
+
+    #[test]
+    fn test_wait_group_worker() {
+        let rt = current_thread_runtime();
+
+        rt.block_on(async {
+            let wg = WaitGroup::new();
+            let wk = wg.worker();
+
+            for _ in 0..5 {
+                let wi = wk.add();
+
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    wi.done();
+                });
+            }
+
+            let ret = tokio::time::timeout(tokio::time::Duration::from_secs(10), wg.wait()).await;
+            assert!(ret.is_ok());
+            let ret = ret.unwrap();
+            assert!(ret.is_ok());
+        });
+    }
+
+    #[test]
+    fn test_wait_group_worker_reuse() {
+        let rt = current_thread_runtime();
+
+        rt.block_on(async {
+            let wg = WaitGroup::new();
+            let wk = wg.worker();
+
+            for _ in 0..5 {
+                let wi = wk.add();
+
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    wi.done();
+                });
+            }
+
+            let ret = tokio::time::timeout(tokio::time::Duration::from_secs(10), wg.wait()).await;
+            assert!(ret.is_ok());
+            let ret = ret.unwrap();
+            assert!(ret.is_ok());
+
+            let wk = wg.worker();
+            let wi = wk.add();
+
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                wi.done();
+            });
+
+            let ret = tokio::time::timeout(tokio::time::Duration::from_secs(10), wg.wait()).await;
+            assert!(ret.is_ok());
+            let ret = ret.unwrap();
+            assert!(ret.is_ok());
+        });
+    }
+
+    #[test]
+    fn test_wait_group_worker_clone() {
+        let rt = current_thread_runtime();
+
+        rt.block_on(async {
+            let wg = WaitGroup::new();
+            let wk = wg.worker();
+
+            for _ in 0..5 {
+                let wi = wk.worker().add();
+
+                tokio::spawn(async move {
+                    let nested_wi = wi.worker().add();
+                    tokio::spawn(async move {
+                        nested_wi.done();
+                    });
+                    wi.done();
+                });
+            }
+
+            let ret = tokio::time::timeout(tokio::time::Duration::from_secs(10), wg.wait()).await;
+            assert!(ret.is_ok());
+            let ret = ret.unwrap();
+            assert!(ret.is_ok());
         });
     }
 }
