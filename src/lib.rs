@@ -116,6 +116,7 @@ struct Inner {
     waker: Mutex<Option<Waker>>,
     count: AtomicI32,
     error: Mutex<Option<Arc<anyhow::Error>>>,
+    wait_complete: AtomicI32,
 }
 
 impl Inner {
@@ -124,6 +125,7 @@ impl Inner {
             waker: Mutex::new(None),
             count: AtomicI32::new(0),
             error: Mutex::new(None),
+            wait_complete: AtomicI32::new(0),
         }
     }
 
@@ -145,27 +147,76 @@ impl Inner {
         self.notify();
     }
 
+
     pub fn reset_error(&self) {
         *self.error.lock().unwrap() = None;
+    }
+
+    pub fn reset(&self) {
+        *self.error.lock().unwrap() = None;
+        let wait_complete = self.wait_complete.swap(0, Ordering::SeqCst);
+        let count = self.count.swap(0, Ordering::SeqCst);
+        if wait_complete > 0 {
+            if count != wait_complete {
+                panic!("Other threads might still be using it")
+            }
+        } else {
+            if count != 0 {
+                panic!("Other threads might still be using it")
+            }
+        }
     }
 
     pub fn get_error(&self) -> Option<Arc<anyhow::Error>> {
         self.error.lock().unwrap().clone()
     }
 
+
+    pub fn add(&self) {
+        let count = self.count.fetch_add(1, Ordering::SeqCst) + 1;
+        let wait_complete = self.wait_complete();
+        if wait_complete > 0 {
+            if count > wait_complete {
+                panic!("Other threads might still be using it")
+            } else if count == wait_complete {
+                self.notify();
+            }
+        }
+    }
+
+    pub fn add_num(&self, num: i32) {
+        let count = self.count.fetch_add(num, Ordering::SeqCst) + 1;
+        let wait_complete = self.wait_complete();
+        if wait_complete > 0 {
+            if count > wait_complete {
+                panic!("Other threads might still be using it")
+            } else if count == wait_complete {
+                self.notify();
+            }
+        }
+    }
+
     pub fn done(&self) {
-        let count = self.count.fetch_sub(1, Ordering::SeqCst);
-        if count <= 0 {
+        let count = self.count.fetch_sub(1, Ordering::SeqCst) - 1;
+        if count < 0 {
             panic!("WaitGroup count < 0");
         }
         // We are the last worker
-        if count == 1 {
+        if count == 0 {
             self.notify();
         }
     }
 
     pub fn count(&self) -> i32 {
         self.count.load(Ordering::SeqCst)
+    }
+
+    pub fn wait_complete(&self) -> i32 {
+        self.wait_complete.load(Ordering::SeqCst)
+    }
+
+    pub fn wait_complete_swap(&self, value: i32) -> i32 {
+        self.wait_complete.swap(value, Ordering::SeqCst)
     }
 }
 
@@ -241,7 +292,7 @@ impl WaitGroup {
     /// or [`set_error`](Self::set_error). See the
     /// [type-level invariants](Self#invariants-callers-responsibility).
     pub fn add(&self) {
-        self.inner.count.fetch_add(1, Ordering::SeqCst);
+        self.inner.add();
     }
 
     /// Increments the worker count by `num`.
@@ -251,7 +302,7 @@ impl WaitGroup {
     /// keeping the running count non-negative; the library does not validate
     /// `num`.
     pub fn add_num(&self, num: i32) {
-        self.inner.count.fetch_add(num, Ordering::SeqCst);
+        self.inner.add_num(num)
     }
 
     /// Decrements the worker count by `1` and notifies the current waiter if
@@ -266,13 +317,17 @@ impl WaitGroup {
         self.inner.done()
     }
 
-    /// Waits until either the worker count reaches `0` or a worker reports an
-    /// error via [`set_error`](Self::set_error).
+    /// Waits until the worker count reaches `0` (or an error is reported).
+    ///
+    /// Use with the **add → done** pattern: each worker calls [`add`](Self::add)
+    /// (or [`guard_add`](Self::guard_add)) when it starts, and [`done`](Self::done)
+    /// when it finishes. `wait` returns `Ok` once every `add` has a matching
+    /// `done` and the count is back to zero.
     ///
     /// # Returns
     ///
-    /// - `Ok(())` once all registered workers have called `done` and no error
-    ///   has been recorded.
+    /// - `Ok(())` once all workers have called `done` and no error has been
+    ///   recorded.
     /// - `Err(_)` if any worker called `set_error`. The error is **sticky**;
     ///   call [`reset_error`](Self::reset_error) before reusing this
     ///   `WaitGroup` for a new round of work.
@@ -284,6 +339,10 @@ impl WaitGroup {
     /// so earlier waiters can be stuck forever. See the
     /// [type-level invariants](Self#invariants-callers-responsibility).
     pub async fn wait(&self) -> Result<()> {
+        let wait_complete = self.inner.wait_complete_swap(0);
+        if wait_complete != 0 {
+            panic!("Other threads might still be using it.")
+        }
         WaitGroupFuture::new(&self.inner).await
     }
 
@@ -313,13 +372,33 @@ impl WaitGroup {
         self.inner.done();
     }
 
-    /// Clears any error previously recorded by [`set_error`](Self::set_error).
-    ///
-    /// Call this before reusing the `WaitGroup` after a failed `wait`,
-    /// otherwise the next `wait` will immediately return the stale error.
-    /// It is safe to call when no error is set (it is a no-op in that case).
     pub fn reset_error(&self) {
         self.inner.reset_error();
+    }
+
+    pub fn reset(&self) {
+        self.inner.reset();
+    }
+
+    /// Legacy API: obtain a [`Worker`] handle for the add-only registration path.
+    pub fn worker(&self) -> Worker {
+        Worker {
+            inner: self.inner.clone(),
+        }
+    }
+
+    /// Legacy API: wait until `count` workers have called [`add`](Self::add).
+    ///
+    /// Unlike [`wait`](Self::wait), this does **not** require [`done`](Self::done).
+    /// It returns once the worker count reaches `count`. Call [`reset`](Self::reset)
+    /// before the next round when `count` still equals the `wait_complete`
+    /// target from the last call.
+    pub async fn wait_complete(&self, count: usize) -> Result<()> {
+        let wait_complete = self.inner.wait_complete_swap(count as i32);
+        if wait_complete > 0 && wait_complete != count as i32 {
+            panic!("Other threads might still be using it.")
+        }
+        WaitGroupFuture::new(&self.inner).await
     }
 }
 
@@ -390,6 +469,10 @@ impl Future for WaitGroupFuture<'_> {
         if count < 0 {
             return Poll::Ready(Err(anyhow!("err:count < 0 => count:{}", count)));
         }
+        let wait_complete = self.inner.wait_complete();
+        if wait_complete > 0 && count > wait_complete {
+            return Poll::Ready(Err(anyhow!("err:count:{} > wait_complete:{}", count, wait_complete)));
+        }
 
         if let Some(e) = self.inner.get_error() {
             return Poll::Ready(Err(anyhow!(
@@ -399,12 +482,97 @@ impl Future for WaitGroupFuture<'_> {
             )));
         }
 
-        match count {
-            0 => Poll::Ready(Ok(())),
-            _ => Poll::Pending,
+        if count == wait_complete {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
         }
     }
 }
+
+
+///下面的接口是为了兼容老版本
+/// A worker registered in a `WaitGroup`.
+///
+/// Refer to the [crate level documentation](crate) for details.
+#[derive(Clone)]
+pub struct Worker {
+    inner: Arc<Inner>,
+}
+
+impl fmt::Debug for Worker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let count = self.inner.count();
+        f.debug_struct("Worker").field("count", &count).finish()
+    }
+}
+
+impl Worker {
+    /// Notify the `WaitGroup` that this worker has finished execution.
+    pub fn worker(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+    pub fn add(&self) -> WorkerInner {
+        self.inner.add();
+        WorkerInner {
+            inner: self.inner.clone(),
+        }
+    }
+
+    pub fn count(&self) -> i32 {
+        self.inner.count()
+    }
+
+    pub fn error(&self, err: anyhow::Error) {
+       self.set_error(err)
+    }
+
+    pub fn set_error(&self, err: anyhow::Error) {
+        self.inner.set_error(err);
+        self.inner.done();
+    }
+}
+
+///下面的接口是为了兼容老版本
+pub struct WorkerInner {
+    inner: Arc<Inner>,
+}
+
+impl fmt::Debug for WorkerInner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let count = self.inner.count();
+        f.debug_struct("WorkerInner").field("count", &count).finish()
+    }
+}
+
+impl WorkerInner {
+    pub fn worker(&self) -> Worker {
+        Worker {
+            inner: self.inner.clone(),
+        }
+    }
+
+    pub fn count(&self) -> i32 {
+        self.inner.count()
+    }
+
+    pub fn done(&self) {
+        self.inner.done()
+    }
+
+    pub fn error(&self, err: anyhow::Error) {
+        self.set_error(err)
+    }
+
+    pub fn set_error(&self, err: anyhow::Error) {
+        self.inner.set_error(err);
+        self.inner.done();
+    }
+}
+
+
 
 #[cfg(test)]
 mod tests {
@@ -553,6 +721,171 @@ mod tests {
 
             let ret = wg.wait().await;
             assert!(ret.is_err());
+        });
+    }
+
+    fn current_thread_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .enable_io()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_wait_complete() {
+        let rt = current_thread_runtime();
+
+        rt.block_on(async {
+            let wg = WaitGroup::new();
+
+            for _ in 0..5 {
+                let wg = wg.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    wg.add();
+                });
+            }
+
+            let ret = wg.wait_complete(5).await;
+            assert!(ret.is_ok());
+            assert_eq!(wg.count(), 5);
+        });
+    }
+
+    #[test]
+    fn test_wait_complete_error() {
+        let rt = current_thread_runtime();
+
+        rt.block_on(async {
+            let wg = WaitGroup::new();
+
+            for i in 0..5 {
+                let wg = wg.clone();
+                tokio::spawn(async move {
+                    wg.add();
+                    if i == 3 {
+                        wg.set_error(anyhow!("error: i == 3"));
+                    }
+                });
+            }
+
+            let ret = wg.wait_complete(5).await;
+            assert!(ret.is_err());
+        });
+    }
+
+    #[test]
+    fn test_worker_wait_complete() {
+        let rt = current_thread_runtime();
+
+        rt.block_on(async {
+            let wg = WaitGroup::new();
+            let worker = wg.worker();
+
+            for _ in 0..5 {
+                let worker = worker.worker();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    let _inner = worker.add();
+                });
+            }
+
+            let ret = wg.wait_complete(5).await;
+            assert!(ret.is_ok());
+            assert_eq!(worker.count(), 5);
+        });
+    }
+
+    #[test]
+    fn test_worker_wait_complete_error() {
+        let rt = current_thread_runtime();
+
+        rt.block_on(async {
+            let wg = WaitGroup::new();
+            let worker = wg.worker();
+
+            for i in 0..5 {
+                let worker = worker.worker();
+                tokio::spawn(async move {
+                    let inner = worker.add();
+                    if i == 3 {
+                        inner.set_error(anyhow!("error: i == 3"));
+                    }
+                });
+            }
+
+            let ret = wg.wait_complete(5).await;
+            assert!(ret.is_err());
+        });
+    }
+
+    #[test]
+    fn test_reset_after_error() {
+        let rt = current_thread_runtime();
+
+        rt.block_on(async {
+            let wg = WaitGroup::new();
+
+            for i in 0..3 {
+                let wg = wg.clone();
+                wg.add();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    if i == 1 {
+                        wg.set_error(anyhow!("round 1 error"));
+                    } else {
+                        wg.done();
+                    }
+                });
+            }
+
+            assert!(wg.wait().await.is_err());
+
+            // All workers finished; count is 0 — safe to reset.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            wg.reset();
+
+            for _ in 0..3 {
+                let wg = wg.clone();
+                wg.add();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    wg.done();
+                });
+            }
+
+            assert!(wg.wait().await.is_ok());
+        });
+    }
+
+    #[test]
+    fn test_reset_reuse_wait_complete() {
+        let rt = current_thread_runtime();
+
+        rt.block_on(async {
+            let wg = WaitGroup::new();
+
+            for _ in 0..3 {
+                let wg = wg.clone();
+                tokio::spawn(async move {
+                    wg.add();
+                });
+            }
+
+            assert!(wg.wait_complete(3).await.is_ok());
+            assert_eq!(wg.count(), 3);
+            wg.reset();
+
+            for _ in 0..3 {
+                let wg = wg.clone();
+                tokio::spawn(async move {
+                    wg.add();
+                });
+            }
+
+            assert!(wg.wait_complete(3).await.is_ok());
+            assert_eq!(wg.count(), 3);
         });
     }
 }
