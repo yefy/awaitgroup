@@ -240,9 +240,10 @@ impl Future for WaitGroupFuture {
     }
 }
 
+#[derive(Clone)]
 pub struct WaitGroupWorkerArrive {
     inner: Arc<Inner>,
-    is_add: AtomicBool,
+    is_add: Arc<AtomicBool>,
 }
 
 impl fmt::Debug for WaitGroupWorkerArrive {
@@ -257,7 +258,7 @@ impl WaitGroupWorkerArrive {
     fn new(inner: Arc<Inner>) -> Self {
         Self {
             inner,
-            is_add: AtomicBool::new(false),
+            is_add: Arc::new(AtomicBool::new(false)),
         }
     }
 
