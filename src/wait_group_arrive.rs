@@ -1,33 +1,42 @@
 use anyhow::{anyhow, Result};
-use futures::task::AtomicWaker;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 
 struct Inner {
-    waker: AtomicWaker,
+    wakers: Mutex<Vec<Waker>>,
     count: AtomicI32,
     error: Mutex<Option<Arc<anyhow::Error>>>,
     wait_arrive_count: AtomicI32,
-    is_waiting: AtomicBool,
 }
 
 impl Inner {
     pub fn new() -> Self {
         Self {
-            waker: AtomicWaker::new(),
+            wakers: Mutex::new(Vec::new()),
             count: AtomicI32::new(0),
             error: Mutex::new(None),
             wait_arrive_count: AtomicI32::new(0),
-            is_waiting: AtomicBool::new(false),
         }
     }
 
     pub fn notify(&self) {
-        self.waker.wake();
+        let mut wakers = self.wakers.lock().unwrap();
+
+        for w in wakers.drain(..) {
+            w.wake();
+        }
+    }
+
+    pub fn register(&self, waker: &Waker) {
+        let mut wakers = self.wakers.lock().unwrap();
+
+        if !wakers.iter().any(|w| w.will_wake(waker)) {
+            wakers.push(waker.clone());
+        }
     }
 
     pub fn get_error(&self) -> Option<Arc<anyhow::Error>> {
@@ -35,8 +44,8 @@ impl Inner {
     }
 
     pub fn add_num(&self, num: usize) {
-        // 使用 SeqCst 确保 count 和 wait_arrive_count 在多核间的全局可见性顺序
         let prev_count = self.count.fetch_add(num as i32, Ordering::SeqCst);
+
         let count = prev_count + num as i32;
 
         let wait_arrive_count = self.wait_arrive_count();
@@ -68,23 +77,14 @@ impl Inner {
         self.wait_arrive_count.swap(value, Ordering::SeqCst)
     }
 
-    pub fn lock_waiting(&self) -> bool {
-        self.is_waiting
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-    }
-
-    pub fn unlock_waiting(&self) {
-        self.is_waiting.store(false, Ordering::SeqCst);
-    }
-
     pub fn set_error(&self, err: anyhow::Error) {
         let mut error = self.error.lock().unwrap();
+
         if error.is_none() {
             *error = Some(Arc::new(err));
         }
+
         drop(error);
-        // 标记错误后不盲目通知，交由 arrive_error 里的 add 动作后统一 notify 叫醒 Future
     }
 }
 
@@ -122,23 +122,16 @@ impl WaitGroupArrive {
         if count == 0 {
             panic!("wait_arrive count <= 0");
         }
-        // 依靠 lock_waiting 保证全局单消费线程，契合 AtomicWaker 契约
-        if !self.inner.lock_waiting() {
-            panic!("Other threads might still be using it");
-        }
-
-        scopeguard::defer! { self.inner.unlock_waiting() }
 
         let old = self.inner.wait_arrive_count_swap(count as i32);
 
         if old > 0 && old != count as i32 {
-            panic!("Other threads might still be using it");
+            panic!("wait_arrive count not same");
         }
 
         WaitGroupFuture::new(self.inner.clone()).await
     }
 
-    /// compatibility
     pub fn worker(&self) -> WaitGroupWorkerArrive {
         WaitGroupWorkerArrive::new(self.inner.clone())
     }
@@ -154,7 +147,7 @@ impl WaitGroupArrive {
     pub fn arrive_error(&self, err: anyhow::Error) {
         self.inner.set_error(err);
         self.inner.add();
-        self.inner.notify(); // 稳妥地单次唤醒，防止 wait_arrive 线程死锁
+        self.inner.notify();
     }
 }
 
@@ -173,14 +166,16 @@ impl Future for WaitGroupFuture {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         //
-        // 1. 第一次检查状态
+        // 1. first check
         //
+
         let count = self.inner.count();
+
         let wait_arrive_count = self.inner.wait_arrive_count();
+
         let error = self.inner.get_error();
 
         if count < 0 {
-            // 如果报错了，主线程提前退出后残留 worker 继续扣减导致 count < 0 是允许的
             if error.is_none() {
                 return Poll::Ready(Err(anyhow!("err:count < 0 => count:{}", count)));
             }
@@ -203,15 +198,19 @@ impl Future for WaitGroupFuture {
         }
 
         //
-        // 2. 注册 Waker
+        // 2. register
         //
-        self.inner.waker.register(cx.waker());
+
+        self.inner.register(cx.waker());
 
         //
-        // 3. 第二次检查（完美解决 Wake-before-Pending 幽灵）
+        // 3. second check
         //
+
         let count = self.inner.count();
+
         let wait_arrive_count = self.inner.wait_arrive_count();
+
         let error = self.inner.get_error();
 
         if count < 0 {
@@ -298,9 +297,11 @@ impl WaitGroupWorkerArrive {
 
     pub fn arrive_error(&self, err: anyhow::Error) {
         self.inner.set_error(err);
+
         if self.lock_add() {
             self.inner.add();
         }
+
         self.inner.notify();
     }
 }

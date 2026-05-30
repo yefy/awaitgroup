@@ -1,33 +1,49 @@
 use anyhow::{anyhow, Result};
-use futures::task::AtomicWaker;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 
 struct Inner {
-    waker: AtomicWaker,
+    // 改成 Vec<Waker>，支持多个 wait 同时等待
+    wakers: Mutex<Vec<Waker>>,
+
     count: AtomicI32,
     error: Mutex<Option<Arc<anyhow::Error>>>,
-    is_waiting: AtomicBool,
+
     is_closing: AtomicBool,
 }
 
 impl Inner {
     pub fn new() -> Self {
         Self {
-            waker: AtomicWaker::new(),
+            wakers: Mutex::new(Vec::new()),
             count: AtomicI32::new(0),
             error: Mutex::new(None),
-            is_waiting: AtomicBool::new(false),
             is_closing: AtomicBool::new(false),
         }
     }
 
     pub fn notify(&self) {
-        self.waker.wake();
+        let wakers = {
+            let mut wakers = self.wakers.lock().unwrap();
+            std::mem::take(&mut *wakers)
+        };
+
+        for w in wakers {
+            w.wake();
+        }
+    }
+
+    pub fn register(&self, waker: &Waker) {
+        let mut wakers = self.wakers.lock().unwrap();
+
+        // 避免重复注册同一个 waker
+        if !wakers.iter().any(|w| w.will_wake(waker)) {
+            wakers.push(waker.clone());
+        }
     }
 
     pub fn get_error(&self) -> Option<Arc<anyhow::Error>> {
@@ -42,11 +58,11 @@ impl Inner {
         if self.is_closing.load(Ordering::SeqCst) {
             panic!("WaitGroup::add called during wait");
         }
+
         self.count.fetch_add(num as i32, Ordering::SeqCst);
     }
 
     pub fn done(&self) {
-        // 统一使用 SeqCst，配合 Future 中的双检查机制
         let prev_count = self.count.fetch_sub(1, Ordering::SeqCst);
         let count = prev_count - 1;
 
@@ -63,23 +79,14 @@ impl Inner {
         self.count.load(Ordering::SeqCst)
     }
 
-    pub fn lock_waiting(&self) -> bool {
-        self.is_waiting
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-    }
-
-    pub fn unlock_waiting(&self) {
-        self.is_waiting.store(false, Ordering::SeqCst);
-    }
-
     pub fn set_error(&self, err: anyhow::Error) {
         let mut error = self.error.lock().unwrap();
+
         if error.is_none() {
             *error = Some(Arc::new(err));
         }
+
         drop(error);
-        // 💡 标记错误后，外层会通过 done() 或者是明确的 notify 来驱使 Future 唤醒
     }
 }
 
@@ -123,9 +130,9 @@ impl WaitGroup {
 
     pub fn done_error(&self, err: anyhow::Error) {
         self.inner.set_error(err);
-        // 先设错误，后 done。即便 done 内部扣出负数也不会崩溃
+
         self.inner.done();
-        // 额外强行唤醒一次，确保 wait 线程不用等 count 归零就能立即收到异常并返回
+
         self.inner.notify();
     }
 
@@ -135,15 +142,13 @@ impl WaitGroup {
 
     pub fn guard_add(&self) -> WaitGroupGuard {
         self.add();
+
         WaitGroupGuard::new(self.inner.clone())
     }
 
     pub async fn wait(&self) -> Result<()> {
-        if !self.inner.lock_waiting() {
-            panic!("Other threads might still be using it");
-        }
+        // 多线程 wait 允许
         self.inner.is_closing.store(true, Ordering::SeqCst);
-        scopeguard::defer! { self.inner.unlock_waiting() }
 
         WaitGroupFuture::new(self.inner.clone()).await
     }
@@ -172,11 +177,13 @@ impl Future for WaitGroupFuture {
         // 1. 第一次检查状态
         //
         let count = self.inner.count();
+
         if count < 0 {
             panic!("WaitGroup count < 0");
         }
 
         let error = self.inner.get_error();
+
         if let Some(e) = error {
             return Poll::Ready(Err(anyhow!("err:error => count:{}, err:{}", count, e)));
         }
@@ -188,17 +195,19 @@ impl Future for WaitGroupFuture {
         //
         // 2. 注册 Waker
         //
-        self.inner.waker.register(cx.waker());
+        self.inner.register(cx.waker());
 
         //
-        // 3. 第二次检查（完美闭环 Wake-before-Pending 问题）
+        // 3. 第二次检查（解决 Wake-before-Pending）
         //
         let count = self.inner.count();
+
         if count < 0 {
             panic!("WaitGroup count < 0");
         }
 
         let error = self.inner.get_error();
+
         if let Some(e) = error {
             return Poll::Ready(Err(anyhow!("err:error => count:{}, err:{}", count, e)));
         }
@@ -252,7 +261,9 @@ impl WaitGroupGuard {
 
     pub fn done_error(&self, err: anyhow::Error) {
         self.inner.set_error(err);
+
         self.done();
+
         self.inner.notify();
     }
 }
@@ -281,11 +292,13 @@ impl WaitGroupWorker {
 
     pub fn add(&self) -> WaitGroupInner {
         self.inner.add();
+
         WaitGroupInner::new(self.inner.clone())
     }
 
     pub fn guard_add(&self) -> WaitGroupGuard {
         self.inner.add();
+
         WaitGroupGuard::new(self.inner.clone())
     }
 
@@ -337,7 +350,9 @@ impl WaitGroupInner {
 
     pub fn done_error(&self, err: anyhow::Error) {
         self.inner.set_error(err);
+
         self.done();
+
         self.inner.notify();
     }
 }

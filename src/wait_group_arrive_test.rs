@@ -3,14 +3,22 @@ use anyhow::anyhow;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
     use crate::wait_group_arrive::WaitGroupArrive;
+    use std::time::Duration;
 
     const TASK_DELAY: Duration = Duration::from_millis(20);
     const WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 
     fn current_thread_runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+    }
+
+    fn multi_thread_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
             .enable_time()
             .build()
             .unwrap()
@@ -205,9 +213,59 @@ mod tests {
         });
     }
 
+    /// Concurrent `wait_arrive` with the same count must all complete when target is reached.
     #[test]
-    #[should_panic(expected = "Other threads might still be using it")]
-    fn test_concurrent_wait_arrive_panics() {
+    fn test_concurrent_wait_arrive_same_count() {
+        let rt = current_thread_runtime();
+        rt.block_on(async {
+            let wg = WaitGroupArrive::new();
+
+            let wg2 = wg.clone();
+            let wg3 = wg.clone();
+
+            let w1 = tokio::spawn(async move { wg2.wait_arrive(2).await });
+            let w2 = tokio::spawn(async move { wg3.wait_arrive(2).await });
+
+            tokio::task::yield_now().await;
+            wg.arrive();
+            wg.arrive();
+
+            assert!(w1.await.unwrap().is_ok());
+            assert!(w2.await.unwrap().is_ok());
+        });
+    }
+
+    #[test]
+    fn test_concurrent_wait_arrive_multi_thread_runtime() {
+        let rt = multi_thread_runtime();
+        rt.block_on(async {
+            let wg = WaitGroupArrive::new();
+
+            let mut handles = Vec::new();
+            for _ in 0..3 {
+                let wg = wg.clone();
+                handles.push(tokio::spawn(async move { wg.wait_arrive(5).await }));
+            }
+
+            for _ in 0..5 {
+                let wg = wg.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(TASK_DELAY).await;
+                    wg.arrive();
+                });
+            }
+
+            for h in handles {
+                let ret = tokio::time::timeout(WAIT_TIMEOUT, h).await;
+                assert!(ret.is_ok(), "wait_arrive timed out");
+                assert!(ret.unwrap().unwrap().is_ok());
+            }
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "wait_arrive count not same")]
+    fn test_concurrent_wait_arrive_different_count_panics() {
         let rt = current_thread_runtime();
         rt.block_on(async {
             let wg = WaitGroupArrive::new();
@@ -218,7 +276,7 @@ mod tests {
             });
 
             tokio::task::yield_now().await;
-            let _ = wg.wait_arrive(2).await;
+            let _ = wg.wait_arrive(3).await;
         });
     }
 
@@ -277,7 +335,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Other threads might still be using it")]
+    #[should_panic(expected = "wait_arrive count not same")]
     fn test_wait_arrive_different_target_panics() {
         let rt = current_thread_runtime();
         rt.block_on(async {
@@ -299,6 +357,26 @@ mod tests {
             wg.arrive();
             wg.wait_arrive(1).await.unwrap();
             wg.arrive();
+        });
+    }
+
+    /// All concurrent `wait_arrive` waiters with the same count observe the same error.
+    #[test]
+    fn test_concurrent_wait_arrive_all_see_error() {
+        let rt = current_thread_runtime();
+        rt.block_on(async {
+            let wg = WaitGroupArrive::new();
+            wg.arrive_error(anyhow!("shared"));
+
+            let wg2 = wg.clone();
+            let wg3 = wg.clone();
+            let w1 = tokio::spawn(async move { wg2.wait_arrive(1).await });
+            let w2 = tokio::spawn(async move { wg3.wait_arrive(1).await });
+
+            for h in [w1, w2] {
+                let ret = h.await.unwrap();
+                assert!(format!("{}", ret.unwrap_err()).contains("shared"));
+            }
         });
     }
 

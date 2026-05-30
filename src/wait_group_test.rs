@@ -3,14 +3,22 @@ use anyhow::anyhow;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
     use crate::wait_group::WaitGroup;
+    use std::time::Duration;
 
     const TASK_DELAY: Duration = Duration::from_millis(20);
     const WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 
     fn current_thread_runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+    }
+
+    fn multi_thread_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
             .enable_time()
             .build()
             .unwrap()
@@ -211,21 +219,84 @@ mod tests {
         });
     }
 
+    /// Multiple concurrent `wait` calls on the same group must all complete when count reaches 0.
     #[test]
-    #[should_panic(expected = "Other threads might still be using it")]
-    fn test_concurrent_wait_panics() {
+    fn test_concurrent_wait_same_group() {
+        let rt = current_thread_runtime();
+        rt.block_on(async {
+            let wg = WaitGroup::new();
+            wg.add();
+            wg.add();
+            wg.add();
+
+            let wg_a = wg.clone();
+            let wg_b = wg.clone();
+            let wg_c = wg.clone();
+
+            let w1 = tokio::spawn(async move { wg_a.wait().await });
+            let w2 = tokio::spawn(async move { wg_b.wait().await });
+            let w3 = tokio::spawn(async move { wg_c.wait().await });
+
+            tokio::task::yield_now().await;
+            wg.done();
+            wg.done();
+            wg.done();
+
+            assert!(w1.await.unwrap().is_ok());
+            assert!(w2.await.unwrap().is_ok());
+            assert!(w3.await.unwrap().is_ok());
+        });
+    }
+
+    #[test]
+    fn test_concurrent_wait_multi_thread_runtime() {
+        let rt = multi_thread_runtime();
+        rt.block_on(async {
+            let wg = WaitGroup::new();
+            for _ in 0..5 {
+                wg.add();
+            }
+
+            let mut handles = Vec::new();
+            for _ in 0..3 {
+                let wg = wg.clone();
+                handles.push(tokio::spawn(async move { wg.wait().await }));
+            }
+
+            for _ in 0..5 {
+                let wg = wg.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(TASK_DELAY).await;
+                    wg.done();
+                });
+            }
+
+            for h in handles {
+                let ret = tokio::time::timeout(WAIT_TIMEOUT, h).await;
+                assert!(ret.is_ok(), "wait timed out");
+                assert!(ret.unwrap().unwrap().is_ok());
+            }
+        });
+    }
+
+    #[test]
+    fn test_concurrent_wait_wakes_all_waiters() {
         let rt = current_thread_runtime();
         rt.block_on(async {
             let wg = WaitGroup::new();
             wg.add();
 
             let wg2 = wg.clone();
-            tokio::spawn(async move {
-                wg2.wait().await.unwrap();
-            });
+            let wg3 = wg.clone();
+
+            let waiter1 = tokio::spawn(async move { wg2.wait().await });
+            let waiter2 = tokio::spawn(async move { wg3.wait().await });
 
             tokio::task::yield_now().await;
-            let _ = wg.wait().await;
+            wg.done();
+
+            assert!(waiter1.await.unwrap().is_ok());
+            assert!(waiter2.await.unwrap().is_ok());
         });
     }
 
@@ -284,7 +355,7 @@ mod tests {
         });
     }
 
-    /// `unlock_waiting` runs when `wait` returns, so a later `wait` can take the lock again.
+    /// Sequential `wait` on an idle group (count 0) is allowed after a prior `wait` completed.
     #[test]
     fn test_second_wait_ok_after_unlock() {
         let rt = current_thread_runtime();
@@ -322,6 +393,27 @@ mod tests {
             let wg = WaitGroup::new();
             assert_wait_ok(&wg).await;
             wg.add();
+        });
+    }
+
+    /// All concurrent waiters observe the same sticky error.
+    #[test]
+    fn test_concurrent_wait_all_see_error() {
+        let rt = current_thread_runtime();
+        rt.block_on(async {
+            let wg = WaitGroup::new();
+            wg.add();
+            wg.done_error(anyhow!("shared"));
+
+            let wg2 = wg.clone();
+            let wg3 = wg.clone();
+            let w1 = tokio::spawn(async move { wg2.wait().await });
+            let w2 = tokio::spawn(async move { wg3.wait().await });
+
+            for h in [w1, w2] {
+                let ret = h.await.unwrap();
+                assert!(format!("{}", ret.unwrap_err()).contains("shared"));
+            }
         });
     }
 
