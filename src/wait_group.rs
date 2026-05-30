@@ -12,8 +12,6 @@ struct Inner {
 
     count: AtomicI32,
     error: Mutex<Option<Arc<anyhow::Error>>>,
-
-    is_closing: AtomicBool,
 }
 
 impl Inner {
@@ -22,7 +20,6 @@ impl Inner {
             wakers: Mutex::new(Vec::new()),
             count: AtomicI32::new(0),
             error: Mutex::new(None),
-            is_closing: AtomicBool::new(false),
         }
     }
 
@@ -55,10 +52,6 @@ impl Inner {
     }
 
     pub fn add_num(&self, num: usize) {
-        if self.is_closing.load(Ordering::SeqCst) {
-            panic!("WaitGroup::add called during wait");
-        }
-
         self.count.fetch_add(num as i32, Ordering::SeqCst);
     }
 
@@ -147,9 +140,6 @@ impl WaitGroup {
     }
 
     pub async fn wait(&self) -> Result<()> {
-        // 多线程 wait 允许
-        self.inner.is_closing.store(true, Ordering::SeqCst);
-
         WaitGroupFuture::new(self.inner.clone()).await
     }
 
