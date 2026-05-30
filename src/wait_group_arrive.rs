@@ -287,6 +287,14 @@ impl WaitGroupWorkerArrive {
         }
     }
 
+    pub fn try_arrive_error(&self, err: anyhow::Error) {
+        if self.lock_add() {
+            self.inner.set_error(err);
+            self.inner.add();
+            self.inner.notify();
+        }
+    }
+
     pub fn arrive_error(&self, err: anyhow::Error) {
         self.inner.set_error(err);
         if self.lock_add() {
