@@ -150,9 +150,7 @@ impl WaitGroup {
 
     /// compatibility
     pub fn worker(&self) -> WaitGroupWorker {
-        WaitGroupWorker {
-            inner: self.inner.clone(),
-        }
+        WaitGroupWorker::new(self.inner.clone())
     }
 }
 

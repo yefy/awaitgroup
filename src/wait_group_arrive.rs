@@ -140,9 +140,7 @@ impl WaitGroupArrive {
 
     /// compatibility
     pub fn worker(&self) -> WaitGroupWorkerArrive {
-        WaitGroupWorkerArrive {
-            inner: self.inner.clone(),
-        }
+        WaitGroupWorkerArrive::new(self.inner.clone())
     }
 
     pub fn arrive(&self) {
@@ -242,9 +240,9 @@ impl Future for WaitGroupFuture {
     }
 }
 
-#[derive(Clone)]
 pub struct WaitGroupWorkerArrive {
     inner: Arc<Inner>,
+    is_add: AtomicBool,
 }
 
 impl fmt::Debug for WaitGroupWorkerArrive {
@@ -257,7 +255,10 @@ impl fmt::Debug for WaitGroupWorkerArrive {
 
 impl WaitGroupWorkerArrive {
     fn new(inner: Arc<Inner>) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            is_add: AtomicBool::new(false),
+        }
     }
 
     pub fn worker(&self) -> Self {
@@ -268,17 +269,29 @@ impl WaitGroupWorkerArrive {
         self.inner.count()
     }
 
+    fn lock_add(&self) -> bool {
+        self.is_add
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
     pub fn arrive(&self) {
-        self.inner.add();
+        if self.lock_add() {
+            self.inner.add();
+        }
     }
 
     pub fn arrive_num(&self, num: usize) {
-        self.inner.add_num(num);
+        if self.lock_add() {
+            self.inner.add_num(num);
+        }
     }
 
     pub fn arrive_error(&self, err: anyhow::Error) {
         self.inner.set_error(err);
-        self.inner.add();
+        if self.lock_add() {
+            self.inner.add();
+        }
         self.inner.notify();
     }
 }
