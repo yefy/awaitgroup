@@ -3,7 +3,7 @@ pub mod wait_group_test;
 
 use anyhow::{anyhow, Result};
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
@@ -11,6 +11,8 @@ struct Inner {
     notify: Notify,
 
     count: AtomicI32,
+
+    version: AtomicU64,
 
     error: Mutex<Option<Arc<anyhow::Error>>>,
 }
@@ -22,12 +24,20 @@ impl Inner {
 
             count: AtomicI32::new(0),
 
+            version: AtomicU64::new(0),
+
             error: Mutex::new(None),
         }
     }
 
     #[inline]
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::Acquire)
+    }
+
+    #[inline]
     pub fn notify_all(&self) {
+        self.version.fetch_add(1, Ordering::Release);
         self.notify.notify_waiters();
     }
 
@@ -133,6 +143,8 @@ impl WaitGroup {
     }
 
     pub async fn wait(&self) -> Result<()> {
+        let mut version = self.inner.version();
+
         loop {
             let count = self.inner.count();
 
@@ -140,10 +152,8 @@ impl WaitGroup {
                 panic!("WaitGroup count < 0");
             }
 
-            let error = self.inner.get_error();
-
-            if let Some(e) = error {
-                return Err(anyhow!("err:error => count:{}, err:{}", count, e));
+            if let Some(err) = self.inner.get_error() {
+                return Err(anyhow!("err:error => count:{}, err:{}", count, err));
             }
 
             if count == 0 {
@@ -151,35 +161,29 @@ impl WaitGroup {
             }
 
             //
-            // 关键：
-            // 先创建 notified future
+            // 先注册 waiter
             //
             let notified = self.inner.notify.notified();
 
             //
-            // 再二次检查状态
-            // 防止 lost wakeup
+            // 再检查 version
             //
-            let count = self.inner.count();
+            let new_version = self.inner.version();
 
-            if count < 0 {
-                panic!("WaitGroup count < 0");
-            }
-
-            let error = self.inner.get_error();
-
-            if let Some(e) = error {
-                return Err(anyhow!("err:error => count:{}, err:{}", count, e));
-            }
-
-            if count == 0 {
-                return Ok(());
+            if new_version != version {
+                version = new_version;
+                continue;
             }
 
             //
             // 真正等待
             //
             notified.await;
+
+            //
+            // 醒来后更新 version
+            //
+            version = self.inner.version();
         }
     }
 
